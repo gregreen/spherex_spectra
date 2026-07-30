@@ -38,15 +38,21 @@ import matplotlib.pyplot as plt
 # Configuration
 # ---------------------------------------------------------------------------
 
+# Reduce the pixel width and FOV of the images by this scale (vs. the default)
+DOWNSAMPLE = 8
+
+# PSF scaling (for making wavelength-dependent effects more visible) vs. the default
+PSF_SCALE = 4.0
+
 N_SOURCES = 256
 N_EXPOSURES = 8
 EXPOSURE_TIME = 15.0           # seconds  (approximate SPHEREx frame time)
 PIXEL_SCALE = 6.2              # arcsec
-DETECTOR_PIXELS = 2048 // 8
+DETECTOR_PIXELS = 2048 // DOWNSAMPLE
 
 # Catalog covers a ~5° × 5° patch on the celestial equator
 CATALOG_CENTER = SkyCoord(ra=180.0, dec=75.0, unit="deg", frame="icrs")
-CATALOG_RADIUS = 3.5 / 8          # degrees  (spherical cap radius)
+CATALOG_RADIUS = 3.5 / DOWNSAMPLE          # degrees  (spherical cap radius)
 
 # Power-law index for source amplitudes
 AMPLITUDE_ALPHA = 1.5          # P(A) ∝ A^{-alpha}
@@ -58,11 +64,16 @@ PNG_PERCENTILE_HI = 99.8
 # Output directory
 PLOTS_DIR = "plots"
 
-# PSF scaling (for making wavelength-dependent effects more visible)
-PSF_SCALE = 4.0
-
 # Background: peak pixel rate of A_min star × this factor
 BACKGROUND_FACTOR = 2.0  # >1 makes faintest stars below background
+
+# Number of wavelength samples used for the local filter-bandpass
+# integral (see ``spherex.image._one_subpixel_rate``, quantile-based
+# integration).  Used throughout: image generation, the true-parameter
+# loss sanity check, inference, and the benchmark.  Thanks to the
+# quantile-based integration, even small values are highly accurate -
+# see ``compare_n_lambda()``.
+N_LAMBDA = 1
 
 # ---------------------------------------------------------------------------
 # Step 1: Estimate amplitude limits
@@ -357,7 +368,7 @@ def _generate_and_save(per_exposure_data, A_min):
             positions_pix,
             params,
             postage_stamp_half_size=half_stamp,
-            n_wavelength_samples=5,
+            n_wavelength_samples=N_LAMBDA,
             oversampling=2,
         )
         img.block_until_ready()
@@ -574,7 +585,8 @@ def main():
             true_log_params.shape[0],
         ),
         rng_inf.uniform(
-            np.log(A_min), np.log(A_max), true_log_params.shape[0]
+            np.log(A_min), np.log(A_max),
+            true_log_params.shape[0]
         ),
     ]).astype(np.float32)
 
@@ -592,28 +604,27 @@ def main():
         _compute_background(band, A_min) for _, _, band, _, _, _ in per_exposure_data
     ]).astype(np.float32)
     # NOTE: n_lambda must match the ``n_wavelength_samples`` used when
-    # generating the images (5, see ``_generate_and_save``) - using a
-    # coarser wavelength grid here than in the forward simulation
-    # introduces a systematic wavelength-integration mismatch that
-    # inflates chi^2 even at the true parameters (was 8.8 with
-    # n_lambda=3 vs the correct ~1.0 with n_lambda=5).
+    # generating the images (N_LAMBDA, see ``_generate_and_save``) - using
+    # a coarser wavelength grid here than in the forward simulation used
+    # to introduce a systematic wavelength-integration mismatch that
+    # inflated chi^2 even at the true parameters (was 8.8 with n_lambda=3
+    # vs the correct ~1.0 with n_lambda=5, before switching to the
+    # quantile-based integration - now much less sensitive to this).
     true_loss = compute_loss(
         inf_exposures, true_log_params, true_log_backgrounds,
-        n_lambda=5, oversampling=2,
+        n_lambda=N_LAMBDA, oversampling=2,
     )
     print(f"\nLoss (chi^2 / pixel) at TRUE parameters: {true_loss:.4f} "
           f"(should be ~1)")
 
-    return 0
-
     rec_log_params, log_backgrounds, losses, lrs = infer_parameters(
         inf_exposures,
         init_log_params,
-        n_steps=128,
-        learning_rate=1e-2,
+        n_steps=512,
+        learning_rate=2e-2,
         momentum=0.5,
         warmup_steps=16,
-        n_lambda=5,
+        n_lambda=N_LAMBDA,
         oversampling=2,
     )
 
@@ -627,7 +638,7 @@ def main():
             pos,
             rec_log_params[np.asarray(src_idx)],
             postage_stamp_half_size=half_stamp,
-            n_wavelength_samples=5,
+            n_wavelength_samples=N_LAMBDA,
             oversampling=2,
         ))
         # pred/background are RATES (s^-1); scale both by EXPOSURE_TIME to
@@ -711,7 +722,7 @@ def _perturb_params(log_temperatures, log_amplitudes, rng, scale=0.05):
 # n_lambda resolution comparison (not a formal test)
 # ---------------------------------------------------------------------------
 
-def compare_n_lambda(n_lambda_values=(1, 3, 5, 15), oversampling=2,
+def compare_n_lambda(n_lambda_values=(1, 3, 15, 63), oversampling=2,
                      exposure_index=0,
                      fname=os.path.join(PLOTS_DIR, "n_lambda_comparison.png")):
     """Generate one exposure's image at several ``n_lambda`` (wavelength
@@ -902,7 +913,7 @@ def run_benchmark(n_repeats=5, source_batch_sizes=(None, 8, 32)):
 
             t0 = time.perf_counter()
             img1 = gen1(positions_pix, p, postage_stamp_half_size=half_stamp,
-                       n_wavelength_samples=3, oversampling=2)
+                       n_wavelength_samples=N_LAMBDA, oversampling=2)
             img1.block_until_ready()
             dt1 = time.perf_counter() - t0
             results["image.py"].append(dt1)
@@ -912,7 +923,7 @@ def run_benchmark(n_repeats=5, source_batch_sizes=(None, 8, 32)):
                        else f"image3.py (batch={bs})")
                 t0 = time.perf_counter()
                 img3 = gen3(positions_pix, p, postage_stamp_half_size=half_stamp,
-                           n_wavelength_samples=3, oversampling=2,
+                           n_wavelength_samples=N_LAMBDA, oversampling=2,
                            source_batch_size=bs)
                 img3.block_until_ready()
                 dt3 = time.perf_counter() - t0
@@ -959,7 +970,7 @@ def run_benchmark(n_repeats=5, source_batch_sizes=(None, 8, 32)):
         infer_parameters(
             inf_exposures, init_log_params, n_steps=n_bench_steps,
             learning_rate=1e-3, warmup_steps=1, momentum=0.0,
-            n_lambda=3, oversampling=2, batched=batched,
+            n_lambda=N_LAMBDA, oversampling=2, batched=batched,
         )
         dt = time.perf_counter() - t0
         print(f"  batched={batched!s:5s}: {n_bench_steps} steps in {dt:.2f}s "
