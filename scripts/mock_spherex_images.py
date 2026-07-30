@@ -661,7 +661,13 @@ def main():
 
         # residual image (independent percentile stretch)
         resid = np.asarray(noisy_img) - pred_bg
-        vr_min, vr_max = np.percentile(resid, [PNG_PERCENTILE_LO, PNG_PERCENTILE_HI])
+        mask = noisy_img > np.median(noisy_img) + 3 * np.median(sigma_img)
+
+        if np.any(mask):
+            vr_min, vr_max = np.percentile(resid[mask], [PNG_PERCENTILE_LO, PNG_PERCENTILE_HI])
+        else:
+            vr_min, vr_max = np.percentile(resid, [PNG_PERCENTILE_LO, PNG_PERCENTILE_HI])
+
         if vr_max <= vr_min:
             vr_max = vr_min + 1e-30
         resid_scaled = np.clip(
@@ -673,20 +679,44 @@ def main():
         Image.fromarray(resid_scaled.T, mode="L").save(fname_resid)
         print(f"  Saved {fname_pred}, {fname_resid}")
 
+        # residual score image
+        resid_score = resid / sigma_img
+        vmin_s, vmax_s = np.percentile(resid_score, [PNG_PERCENTILE_LO, PNG_PERCENTILE_HI])
+        if vmax_s <= vmin_s:
+            vmax_s = vmin_s + 1e-30
+        resid_score_scaled = np.clip(
+            (resid_score - vmin_s) / (vmax_s - vmin_s) * 255.0, 0, 255
+        ).astype(np.uint8)
+        fname_resid_score = os.path.join(
+            PLOTS_DIR, f"exposure_{k:03d}_band_{band}_resid_score.png"
+        )
+        Image.fromarray(resid_score_scaled.T, mode="L").save(fname_resid_score)
+        print(f"  Saved {fname_resid_score}")
+
     # ---- Step 9: diagnostic plots ------------------------------------------
     print("\n--- Step 9: Diagnostic plots ---")
 
     plot_loss_history(losses, lrs,
                       os.path.join(PLOTS_DIR, "loss_history.svg"))
 
-    # Bright sources: peak > 5× background in ≥3 bands (simplified)
-    # NOTE: indexed in the FULL catalog space (same as true_log_params /
-    # rec_log_params), not the in_any-filtered skycoords_obs subset.
+    # Bright sources: TRUE peak flux > 5x background in >=3 bands
+    # (simplified).  NOTE: two bugs fixed here:
+    # 1. Must use the TRUE amplitude, not the RECOVERED one - using the
+    #    recovered amplitude made the "bright" label circular/contaminated
+    #    by exactly the convergence issue being diagnosed (a source whose
+    #    amplitude estimate diverges upward would get mislabeled bright).
+    # 2. Must actually check per-exposure participation (that exposure's
+    #    own background level, and only for sources present in it via
+    #    src_idx) - the previous version ignored src_idx/gen/_hs entirely
+    #    and just added the same whole-catalog check unconditionally on
+    #    every loop iteration, regardless of which sources were actually
+    #    observed in that exposure.
+    true_A = np.exp(true_log_params[:, 1])
     n_above = np.zeros(true_log_params.shape[0], dtype=int)
-    for _noisy, _sigma, _pos, gen, _hs, _src_idx in inf_exposures:
-        rec_A = np.exp(np.asarray(rec_log_params)[:, 1])
-        bg_level = np.exp(np.asarray(log_backgrounds))[0]  # avg
-        n_above += (rec_A > 5.0 * bg_level).astype(int)
+    for k, (_noisy, _sigma, _pos, _gen, _hs, src_idx) in enumerate(inf_exposures):
+        idx = np.asarray(src_idx)
+        bg_level = np.exp(float(log_backgrounds[k]))
+        n_above[idx] += (true_A[idx] > 5.0 * bg_level).astype(int)
     bright = n_above >= 3
 
     plot_comparison(true_log_params, np.asarray(rec_log_params), bright,
