@@ -29,7 +29,7 @@ from spherex.plotting_utils import HistEqNormalize
 from jax.scipy.integrate import trapezoid
 import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from inference import infer_parameters, compute_loss, plot_loss_history, plot_comparison
+from inference import infer_parameters, infer_parameters_lm, compute_loss, plot_loss_history, plot_comparison
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -39,13 +39,13 @@ import matplotlib.pyplot as plt
 # ---------------------------------------------------------------------------
 
 # Reduce the pixel width and FOV of the images by this scale (vs. the default)
-DOWNSAMPLE = 8
+DOWNSAMPLE = 4
 
 # PSF scaling (for making wavelength-dependent effects more visible) vs. the default
-PSF_SCALE = 4.0
+PSF_SCALE = 1.5
 
-N_SOURCES = 256
-N_EXPOSURES = 8
+N_SOURCES = 1024 // 2
+N_EXPOSURES = 16
 EXPOSURE_TIME = 15.0           # seconds  (approximate SPHEREx frame time)
 PIXEL_SCALE = 6.2              # arcsec
 DETECTOR_PIXELS = 2048 // DOWNSAMPLE
@@ -508,7 +508,7 @@ def _plot_sky_locations(skycoords, exposures, fname):
     print(f"Saved {fname}")
 
 
-def main():
+def end_to_end_mock(use_lm=False):
     print("=" * 60)
     print("SPHEREx Mock Exposure Simulation")
     print("=" * 60)
@@ -617,16 +617,67 @@ def main():
     print(f"\nLoss (chi^2 / pixel) at TRUE parameters: {true_loss:.4f} "
           f"(should be ~1)")
 
-    rec_log_params, log_backgrounds, losses, lrs = infer_parameters(
-        inf_exposures,
-        init_log_params,
-        n_steps=512,
-        learning_rate=2e-2,
-        momentum=0.5,
-        warmup_steps=16,
-        n_lambda=N_LAMBDA,
-        oversampling=2,
+    # ---- loss at the INITIAL GUESS, before optimisation ---------------------
+    # (independent of whether --lm is set) - uses the same background
+    # initialisation convention as infer_parameters/infer_parameters_lm
+    # (median counts converted back to a rate via EXPOSURE_TIME).
+    init_log_backgrounds = np.log([
+        max(np.median(np.asarray(mean_img)) / EXPOSURE_TIME, 1e-6)
+        for mean_img, _, _, _, _, _ in inf_exposures
+    ]).astype(np.float32)
+    init_loss = compute_loss(
+        inf_exposures, init_log_params, init_log_backgrounds,
+        n_lambda=N_LAMBDA, oversampling=2,
     )
+    print(f"Loss (chi^2 / pixel) at INITIAL GUESS: {init_loss:.4f}")
+
+    if use_lm:
+        # ---- Phase 1: short SGD warmup (~128 steps) to get into the right
+        # ballpark before LM takes over.  LM converges quadratically near
+        # the optimum, but from a random initialisation the very first
+        # Gauss-Newton step can wildly overshoot (exponentiated
+        # parameterisation).  A few cheap SGD steps fix that.
+        print("\n--- Phase 1: SGD warmup (128 steps) ---")
+        sgd_params, sgd_backgrounds, losses, lrs = infer_parameters(
+            inf_exposures,
+            init_log_params,
+            n_steps=128,
+            learning_rate=2e-2,
+            momentum=0.5,
+            warmup_steps=8,
+            n_lambda=N_LAMBDA,
+            oversampling=2,
+        )
+
+        # ---- Phase 2: Levenberg-Marquardt, warm-started from SGD ------------
+        print("\n--- Phase 2: Levenberg-Marquardt (optimistix) ---")
+        rec_log_params, log_backgrounds, result, stats = infer_parameters_lm(
+            inf_exposures,
+            sgd_params,
+            init_log_backgrounds=sgd_backgrounds,
+            n_lambda=N_LAMBDA,
+            oversampling=2,
+            max_steps=64,
+            initial_step_size=1e-6,
+            cg_max_steps=100,
+            max_step_size=1.0,
+            verbose=True,
+        )
+        print(f"LM result: {result}")
+        print(f"LM stats: {stats}")
+        # losses/lrs already captured from SGD warmup (kept for plotting)
+    else:
+        rec_log_params, log_backgrounds, losses, lrs = infer_parameters(
+            inf_exposures,
+            init_log_params,
+            n_steps=512,
+            learning_rate=5e-2,
+            momentum=0.0,
+            warmup_steps=16,
+            n_lambda=N_LAMBDA,
+            oversampling=2,
+            precondition_rms=True,
+        )
 
     # ---- Step 8: predicted + residual images --------------------------------
     print("\n--- Step 8: Generating predicted and residual images ---")
@@ -696,8 +747,11 @@ def main():
     # ---- Step 9: diagnostic plots ------------------------------------------
     print("\n--- Step 9: Diagnostic plots ---")
 
-    plot_loss_history(losses, lrs,
-                      os.path.join(PLOTS_DIR, "loss_history.svg"))
+    if losses:
+        plot_loss_history(losses, lrs,
+                          os.path.join(PLOTS_DIR, "loss_history.svg"))
+    else:
+        print("  Skipping loss-history plot (not tracked by the LM solver).")
 
     # Bright sources: TRUE peak flux > 5x background in >=3 bands
     # (simplified).  NOTE: two bugs fixed here:
@@ -758,7 +812,7 @@ def compare_n_lambda(n_lambda_values=(1, 3, 15, 63), oversampling=2,
     """Generate one exposure's image at several ``n_lambda`` (wavelength
     sample count) values and compare them.
 
-    Reuses the catalog / exposure-generation helpers from ``main()`` to
+    Reuses the catalog / exposure-generation helpers from ``end_to_end_mock()`` to
     build a realistic exposure, renders it with each value in
     ``n_lambda_values`` (an arbitrary number of values, at least 2), and
     plots:
@@ -885,7 +939,7 @@ def run_benchmark(n_repeats=5, source_batch_sizes=(None, 8, 32)):
     """Benchmark image generation (image.py vs image3.py) and inference
     (legacy per-exposure JIT vs per-band-grouped batched JIT).
 
-    Reuses the catalog/exposure-generation helpers from ``main()`` so the
+    Reuses the catalog/exposure-generation helpers from ``end_to_end_mock()`` so the
     benchmark exercises realistic source counts / postage-stamp sizes.
     Prints a timing summary; not a pytest test.
     """
@@ -1017,6 +1071,9 @@ if __name__ == "__main__":
     parser.add_argument("--compare-n-lambda", action="store_true",
                        help="Compare images generated with n_lambda = "
                             "3, 5, 15 instead of the full simulation.")
+    parser.add_argument("--lm", action="store_true",
+                       help="Use Levenberg-Marquardt (optimistix) instead "
+                            "of SGD for the inference step.")
     args = parser.parse_args()
 
     if args.benchmark:
@@ -1024,4 +1081,4 @@ if __name__ == "__main__":
     elif args.compare_n_lambda:
         compare_n_lambda()
     else:
-        main()
+        end_to_end_mock(use_lm=args.lm)

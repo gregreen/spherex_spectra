@@ -172,6 +172,86 @@ def _group_sumsq(group, log_params, log_backgrounds_group, n_lambda, oversamplin
 
 
 # ---------------------------------------------------------------------------
+# Flat residual vector (for Levenberg-Marquardt / Gauss-Newton, Part D)
+# ---------------------------------------------------------------------------
+
+def _per_exposure_diff(mean_img, sigma_img, positions, log_params_global,
+                       source_idx, gen_module, log_background, half_stamp,
+                       n_lambda, oversampling):
+    """Flattened (pre-square) normalised residual vector for one exposure.
+
+    Same forward model/convention as :func:`_per_exposure_sumsq`, but
+    returns the residual array itself (flattened to 1-D) rather than the
+    summed square - needed as the ``fn(y, args) -> residuals`` callable
+    expected by ``optimistix.least_squares``.
+    """
+    lp_exp = log_params_global[source_idx]
+    pred = gen_module(
+        positions,
+        lp_exp,
+        postage_stamp_half_size=half_stamp,
+        n_wavelength_samples=n_lambda,
+        oversampling=oversampling,
+    )
+    pred_bg = (pred + jnp.exp(log_background)) * EXPOSURE_TIME
+    diff = (mean_img - pred_bg) / sigma_img
+    return diff.reshape(-1)
+
+
+def _group_diffs(group, log_params, log_backgrounds_group, n_lambda, oversampling):
+    """Flattened (pre-square) normalised residual vector for all exposures
+    in one band group (via a single ``jax.lax.scan``, stacking each
+    exposure's residual array then flattening)."""
+
+    def body(carry, xs):
+        mean_img, sigma_img, positions, src_idx, log_bg = xs
+        d = _per_exposure_diff(
+            mean_img, sigma_img, positions, log_params, src_idx,
+            group["gen_mod"], log_bg, group["half_stamp"],
+            n_lambda, oversampling,
+        )
+        return carry, d
+
+    _, diffs = jax.lax.scan(
+        body, None,
+        (group["mean_imgs"], group["sigma_imgs"], group["positions"],
+         group["src_idx"], log_backgrounds_group),
+    )
+    return diffs.reshape(-1)
+
+
+def _make_residual_fn(exposures, n_lambda, oversampling):
+    """Build ``residuals(params) -> flat residual vector`` over the ENTIRE
+    exposure stack simultaneously (all bands/exposures jointly), for use
+    with ``optimistix.least_squares`` (Levenberg-Marquardt/Gauss-Newton).
+
+    ``params`` is ``(log_params, log_backgrounds)``, exactly as used by
+    :func:`infer_parameters`.  Exposures are grouped by band purely as an
+    implementation efficiency (batching same-band exposures through a
+    single ``lax.scan``) - all exposures still contribute to the ONE
+    joint residual vector / least-squares problem; there is no patch
+    decomposition or independent per-band fitting here.
+    """
+    band_groups = [
+        _prepare_band_group(exposures, idx)
+        for idx in _group_exposures_by_band(exposures).values()
+    ]
+
+    def residuals(params):
+        log_params, log_backgrounds = params
+        pieces = []
+        for group in band_groups:
+            idx_arr = jnp.asarray(group["group_idx"])
+            lbg_group = log_backgrounds[idx_arr]
+            pieces.append(
+                _group_diffs(group, log_params, lbg_group, n_lambda, oversampling)
+            )
+        return jnp.concatenate(pieces)
+
+    return residuals
+
+
+# ---------------------------------------------------------------------------
 # Single fully-jitted training step
 # ---------------------------------------------------------------------------
 
@@ -411,6 +491,244 @@ def infer_parameters(
                          lr=f"{float(lr):.2e}")
 
     return log_params, log_backgrounds, losses, learning_rates
+
+
+# ---------------------------------------------------------------------------
+# Levenberg-Marquardt / Gauss-Newton inference (via optimistix)
+# ---------------------------------------------------------------------------
+
+def _make_lm_solver(rtol, atol, cg_rtol, cg_atol, cg_max_steps, initial_step_size,
+                    trust_region_low_constant, trust_region_high_constant,
+                    max_step_size, verbose):
+    """Build a Levenberg-Marquardt solver with a CONFIGURABLE initial
+    trust-region radius (damping) and a maximum trust-region radius.
+
+    ``optimistix.LevenbergMarquardt`` hardcodes the initial trust-region
+    step size to 1.0 (i.e. an initially near-undamped Gauss-Newton step) -
+    this is far too aggressive for our exponentiated (``exp(log_T)``,
+    ``exp(log_A)``) parameterisation when starting far from the optimum:
+    a "reasonable-looking" step in log-parameter space can correspond to
+    an enormous change in predicted flux, causing the very first step to
+    wildly overshoot (observed: loss exploding from ~1e5 to ~1e8, then the
+    inner CG linear solve returning non-finite output at a badly
+    conditioned point).  Subclassing lets us start with a much smaller,
+    more conservative initial step (heavier damping / closer to steepest
+    descent), while keeping everything else about
+    ``optimistix.LevenbergMarquardt`` (damped-Newton descent, classical
+    trust-region accept/reject + grow/shrink logic) unchanged.
+
+    The ``max_step_size`` cap prevents the trust region from growing
+    unboundedly after a few accepted steps (the default growth factor 3.5
+    means 0.01 → 0.035 → 0.12 → 0.43 → 1.5 → 5.3 in just 5 steps).  Once
+    the trust region becomes too large the Levenberg-Marquardt damping
+    (λ ~ 1/step_size²) effectively vanishes, the normal-equations matrix
+    ``J^T J + λI`` becomes ``J^T J`` (which may be near-singular for
+    ill-conditioned problems), and the inner CG solver spins forever
+    trying to converge.
+    """
+    import lineax as lx
+    import optimistix as optx
+
+    class _InitStepTrustRegion(optx.ClassicalTrustRegion):
+        """``ClassicalTrustRegion`` with a configurable initial step size
+        (upstream hardcodes this to 1.0 - see ``_AbstractTrustRegion.init``)
+        and a maximum step size cap."""
+
+        max_step_size: float = 1.0
+
+        def init(self, y, f_info_struct):
+            del f_info_struct
+            return type(super().init(y, None))(
+                step_size=jnp.array(initial_step_size)
+            )
+
+        def step(self, first_step, y, y_eval, f_info, f_eval_info, state):
+            new_step_size, accept, result, new_state = (
+                super().step(first_step, y, y_eval, f_info, f_eval_info, state)
+            )
+            new_step_size = jnp.minimum(new_step_size, self.max_step_size)
+            return new_step_size, accept, result, new_state
+
+    class _DampedLevenbergMarquardt(optx.AbstractGaussNewton):
+        """Same as ``optimistix.LevenbergMarquardt``, but with a
+        configurable initial trust-region radius, trust-region
+        grow/shrink constants, and maximum step size."""
+
+        rtol: float
+        atol: float
+        norm: object
+        descent: optx.DampedNewtonDescent
+        search: _InitStepTrustRegion
+        verbose: frozenset
+
+        def __init__(self, rtol, atol, linear_solver, norm=optx.max_norm,
+                    verbose=frozenset()):
+            self.rtol = rtol
+            self.atol = atol
+            self.norm = norm
+            self.descent = optx.DampedNewtonDescent(linear_solver=linear_solver)
+            self.search = _InitStepTrustRegion(
+                low_constant=trust_region_low_constant,
+                high_constant=trust_region_high_constant,
+                max_step_size=max_step_size,
+            )
+            self.verbose = verbose
+
+    return _DampedLevenbergMarquardt(
+        rtol=rtol,
+        atol=atol,
+        linear_solver=lx.Normal(lx.CG(rtol=cg_rtol, atol=cg_atol, max_steps=cg_max_steps)),
+        verbose=frozenset({"loss", "step_size"}) if verbose else frozenset(),
+    )
+
+
+def infer_parameters_lm(
+    exposures,
+    init_log_params,
+    init_log_backgrounds=None,
+    n_lambda=5,
+    oversampling=2,
+    rtol=1e-4,
+    atol=1e-6,
+    max_steps=64,
+    cg_rtol=1e-2,
+    cg_atol=1e-4,
+    cg_max_steps=None,
+    initial_step_size=1.0,
+    trust_region_low_constant=0.25,
+    trust_region_high_constant=3.5,
+    max_step_size=1.0,
+    verbose=False,
+):
+    """Infer log(temperature), log(amplitude) and log(background) via
+    Levenberg-Marquardt (damped Gauss-Newton), using ``optimistix``.
+
+    Unlike :func:`infer_parameters` (first-order preconditioned SGD), this
+    solves the nonlinear least-squares problem using the model's Jacobian
+    (via matrix-free Jacobian-vector products - ``lineax.Normal(lineax.CG(...))``
+    as the inner linear solve, so a dense Jacobian is never materialised), which is the
+    natural, much faster-converging choice for a smooth chi^2 objective
+    like this one.
+
+    Takes EXACTLY the same ``exposures``/``init_log_params`` inputs as
+    :func:`infer_parameters` (no patch/tiling logic here - that is handled
+    elsewhere).  The entire exposure stack is fit SIMULTANEOUSLY (required
+    to constrain source spectra from multiple bands/exposures - this
+    mirrors the joint fit `infer_parameters(batched=...)` already
+    performs, just with a different optimiser), and background parameters
+    are fit jointly alongside the source parameters (may change if
+    backgrounds become more complex in future, e.g. a Gaussian process).
+
+    Parameters
+    ----------
+    exposures : list of (mean_img, sigma_img, positions_pix,
+                         gen_module, half_stamp, source_idx)
+        Same format as accepted by :func:`infer_parameters`.
+    init_log_params : (S, P) array
+        Initial log-parameters [log(T/kK), log(A/(W/m2/um))].
+    init_log_backgrounds : (E,) array or None
+        Initial log-background (rate, s^-1) per exposure.  If ``None``
+        (default), initialises from ``log(median(image) / EXPOSURE_TIME)``,
+        matching :func:`infer_parameters`.  Pass an explicit array when
+        warm-starting from a previous optimisation phase (e.g. a short SGD
+        pre-fit before LM takes over).
+    n_lambda : int
+        Wavelength-integration samples.
+    oversampling : int
+        Sub-pixel oversampling factor.
+    rtol, atol : float
+        Relative/absolute tolerance for the Levenberg-Marquardt solve's
+        convergence criterion.
+    max_steps : int
+        Maximum number of Levenberg-Marquardt iterations.
+    cg_rtol, cg_atol : float
+        Relative/absolute tolerance for the inner matrix-free
+        conjugate-gradient linear solve (``lineax.Normal(lineax.CG(...))``)
+        used at each LM
+        step to solve the damped Gauss-Newton normal equations without
+        ever forming a dense Jacobian or J^T J.  CG is terminated early
+        once the residual drops below these tolerances.  Unlike an exact
+        linear solve, LM only needs a *direction* - tolerances looser than
+        the outer LM tolerances (default 1e-2 / 1e-4) are usually
+        sufficient and much faster.
+    cg_max_steps : int or None
+        Maximum number of CG iterations per LM step.  ``None`` (default)
+        lets ``lineax`` choose the number automatically (typically the
+        size of the parameter vector).  Reducing this can dramatically
+        speed up early LM steps where the trust-region damping already
+        limits how far we can move anyway.
+    initial_step_size : float
+        Initial trust-region radius (upstream ``optimistix`` hardcodes
+        this to 1.0, i.e. a nearly undamped first Gauss-Newton step,
+        which can badly overshoot for this exponentiated parameterisation
+        when starting far from the optimum).  Smaller values start closer
+        to steepest descent (heavier damping); the trust-region logic
+        will grow/shrink it adaptively from there.
+    trust_region_low_constant, trust_region_high_constant : float
+        Shrink/growth factors applied to the trust-region radius on a
+        rejected/accepted step respectively (``optimistix`` defaults:
+        0.25 / 3.5).  Lower ``trust_region_high_constant`` grows the
+        radius more conservatively after a good step.
+    max_step_size : float
+        Hard cap on the trust-region radius.  Without this, after ~5
+        accepted steps the radius grows from 0.01 to >5 (due to the 3.5×
+        growth factor), the Levenberg-Marquardt damping λ ~ 1/r²
+        effectively vanishes, and the inner CG solve works on a
+        near-singular ``J^T J`` — which can hang indefinitely.  Default
+        1.0 keeps non-zero damping throughout the solve.
+    verbose : bool
+        If True, print per-step LM progress (loss, step size, etc.) via
+        optimistix's built-in verbosity.
+
+    Returns
+    -------
+    log_params : (S, P) array
+        Optimised log-parameters.
+    log_backgrounds : (E,) array
+        Optimised log-background per exposure.
+    result : optimistix.RESULTS
+        Solver result/status flag; index into ``optimistix.RESULTS`` for
+        a human-readable message (e.g. success, or why it failed/stopped).
+    stats : dict
+        Solver statistics (e.g. number of steps taken), from
+        ``optimistix.Solution.stats``.
+    """
+    import optimistix as optx
+
+    log_params = jnp.asarray(init_log_params, dtype=jnp.float32)
+
+    if init_log_backgrounds is not None:
+        log_backgrounds = jnp.asarray(init_log_backgrounds, dtype=jnp.float32)
+    else:
+        log_backgrounds = jnp.array([
+            jnp.log(jnp.maximum(jnp.median(mean_img) / EXPOSURE_TIME, 1e-6))
+            for mean_img, _, _, _, _, _ in exposures
+        ], dtype=jnp.float32)
+
+    residuals_fn = _make_residual_fn(exposures, n_lambda, oversampling)
+
+    def _fn(y, args):
+        del args
+        return residuals_fn(y)
+
+    y0 = (log_params, log_backgrounds)
+
+    solver = _make_lm_solver(
+        rtol=rtol, atol=atol, cg_rtol=cg_rtol, cg_atol=cg_atol,
+        cg_max_steps=cg_max_steps,
+        initial_step_size=initial_step_size,
+        trust_region_low_constant=trust_region_low_constant,
+        trust_region_high_constant=trust_region_high_constant,
+        max_step_size=max_step_size,
+        verbose=verbose,
+    )
+
+    sol = optx.least_squares(
+        _fn, solver, y0=y0, max_steps=max_steps, throw=False,
+    )
+
+    log_params, log_backgrounds = sol.value
+    return log_params, log_backgrounds, sol.result, sol.stats
 
 
 # ---------------------------------------------------------------------------
