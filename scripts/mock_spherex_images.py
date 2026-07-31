@@ -39,12 +39,18 @@ import matplotlib.pyplot as plt
 # ---------------------------------------------------------------------------
 
 # Reduce the pixel width and FOV of the images by this scale (vs. the default)
-DOWNSAMPLE = 2
+DOWNSAMPLE = 16
 
 # PSF scaling (for making wavelength-dependent effects more visible) vs. the default
 PSF_SCALE = 1.0
 
-N_SOURCES = 1024
+# Minimum postage-stamp half-size in pixels (floor).  Without this, a
+# combination of small PSF, small wavelength range, or coarse pixel scale
+# can produce half_stamp < 2, leaving too little context around each
+# source for the model to fit the local background reliably.
+HALF_STAMP_FLOOR = 3
+
+N_SOURCES = 1024 // 8
 N_EXPOSURES = 32
 EXPOSURE_TIME = 15.0           # seconds  (approximate SPHEREx frame time)
 PIXEL_SCALE = 6.2              # arcsec
@@ -210,7 +216,7 @@ def _generate_exposures(rng):
         lam_min, lam_max, _R, _name = _BANDS[band]
         lam_mid = 0.5 * (lam_min + lam_max)
         fwhm = PSF_SCALE * 6.0 * (lam_mid / 1.0)        # PSF FWHM proportional to lambda
-        half_stamp = int(np.ceil(5.0 * fwhm / PIXEL_SCALE))
+        half_stamp = max(int(np.ceil(5.0 * fwhm / PIXEL_SCALE)), HALF_STAMP_FLOOR)
 
         exposures.append((band, wcs, half_stamp))
         print(f"  Exposure {len(exposures)-1}: Band {band}, "
@@ -687,7 +693,7 @@ def end_to_end_mock(use_lm=False):
         rec_log_params, log_backgrounds, losses, lrs = infer_parameters(
             inf_exposures,
             init_log_params,
-            n_steps=512,
+            n_steps=1024,
             learning_rate=5e-2,
             momentum=0.3,
             warmup_steps=16,
@@ -695,6 +701,14 @@ def end_to_end_mock(use_lm=False):
             oversampling=2,
             precondition_rms=True,
         )
+
+    # ---- loss at the RECOVERED parameters -----------------------------------
+    final_loss = compute_loss(
+        inf_exposures, np.asarray(rec_log_params),
+        np.asarray(log_backgrounds),
+        n_lambda=N_LAMBDA, oversampling=2,
+    )
+    print(f"\nLoss (chi^2 / pixel) at RECOVERED parameters: {final_loss:.4f}")
 
     # ---- Step 8: predicted + residual images --------------------------------
     print("\n--- Step 8: Generating predicted and residual images ---")
@@ -765,8 +779,10 @@ def end_to_end_mock(use_lm=False):
     print("\n--- Step 9: Diagnostic plots ---")
 
     if losses:
-        plot_loss_history(losses, lrs,
-                          os.path.join(PLOTS_DIR, "loss_history.svg"))
+        plot_loss_history(
+            losses, lrs,
+            os.path.join(PLOTS_DIR, "loss_history.svg")
+        )
     else:
         print("  Skipping loss-history plot (not tracked by the LM solver).")
 

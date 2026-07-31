@@ -784,16 +784,59 @@ def infer_parameters_lm(
 # Plotting
 # ---------------------------------------------------------------------------
 
-def plot_loss_history(losses, learning_rates, fname):
-    """Plot loss (left axis) and learning rate (right axis) vs step."""
+def plot_loss_history(losses, learning_rates, fname, final_loss=None):
+    """Plot loss (left axis) and learning rate (right axis) vs step.
+
+    Uses an asinh-based y-scale that transitions smoothly between linear
+    and logarithmic behaviour, centred on ``loss = 1`` (the expected
+    chi² / pixel at the true parameters).  The width of the linear region
+    is set to ``b = 5 * abs(final_loss - 1)`` (or ``5`` if ``final_loss``
+    is not provided), so well-converged runs get a tighter linear window
+    that makes the late-stage convergence easier to see.
+    """
+    from matplotlib.ticker import FixedLocator, NullLocator
+
+    losses = np.asarray(losses, dtype=float)
+    if final_loss is None:
+        final_loss = float(losses[-1]) if len(losses) > 0 else 1.0
+    b = max(5.0 * abs(final_loss - 1.0), 0.5)  # floor at 0.5 to avoid near-zero
+
     fig, ax1 = plt.subplots(figsize=(8, 4))
     ax2 = ax1.twinx()
 
     steps = np.arange(len(losses))
     ax1.plot(steps, losses, "b-", alpha=0.7, linewidth=0.5)
     ax1.set_xlabel("Step")
-    ax1.set_ylabel("Loss", color="b")
-    ax1.set_yscale("log")
+    ax1.set_ylabel("Loss  (chi² / pixel)", color="b")
+    ax1.axhline(y=1.0, color="gray", linestyle=":", linewidth=0.8, alpha=0.6)
+
+    # asinh scale: linear near y=1, logarithmic for |y-1| >> b
+    forward = lambda y: b * np.arcsinh((y - 1.0) / b)
+    inverse = lambda t: b * np.sinh(t / b) + 1.0
+    ax1.set_yscale("function", functions=(forward, inverse))
+
+    # ---- y-tick positions ---------------------------------------------------
+    # Major ticks at powers of 10, and at 1.0 (the true-parameter baseline).
+    loss_max = float(np.max(losses))
+    majors = [1.0]
+    k = 1
+    while 10 ** k <= loss_max * 1.1:
+        majors.append(10.0 ** k)
+        k += 1
+    # Include one below 1 if losses dip there.
+    if loss_max >= 1.0 and float(np.min(losses)) < 0.95:
+        majors.insert(0, 0.5)
+    ax1.yaxis.set_major_locator(FixedLocator(majors))
+
+    # Minor ticks at n × 10^m for n = 2..9 within each decade.
+    minors = []
+    for power in range(k):
+        decade = 10.0 ** power
+        for n in range(2, 10):
+            v = n * decade
+            if v <= loss_max * 1.05:
+                minors.append(v)
+    ax1.yaxis.set_minor_locator(FixedLocator(minors))
 
     ax2.plot(steps, learning_rates, "r-", alpha=0.7)
     ax2.set_ylabel("Learning rate", color="r")
