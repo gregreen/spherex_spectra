@@ -29,7 +29,7 @@ from spherex.plotting_utils import HistEqNormalize
 from jax.scipy.integrate import trapezoid
 import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from inference import infer_parameters, infer_parameters_lm, compute_loss, plot_loss_history, plot_comparison
+from inference import infer_parameters, infer_parameters_lm, compute_loss, compute_lm_loss, plot_loss_history, plot_comparison
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -39,13 +39,13 @@ import matplotlib.pyplot as plt
 # ---------------------------------------------------------------------------
 
 # Reduce the pixel width and FOV of the images by this scale (vs. the default)
-DOWNSAMPLE = 4
+DOWNSAMPLE = 2
 
 # PSF scaling (for making wavelength-dependent effects more visible) vs. the default
-PSF_SCALE = 1.5
+PSF_SCALE = 1.0
 
-N_SOURCES = 1024 // 2
-N_EXPOSURES = 16
+N_SOURCES = 1024
+N_EXPOSURES = 32
 EXPOSURE_TIME = 15.0           # seconds  (approximate SPHEREx frame time)
 PIXEL_SCALE = 6.2              # arcsec
 DETECTOR_PIXELS = 2048 // DOWNSAMPLE
@@ -360,6 +360,7 @@ def _generate_and_save(per_exposure_data, A_min):
                 band=band, psf_scale=PSF_SCALE,
                 image_width=DETECTOR_PIXELS,
                 image_height=DETECTOR_PIXELS,
+                lambda_slope_scale=DOWNSAMPLE,
             )
         gen = band_generators[band]
 
@@ -617,6 +618,22 @@ def end_to_end_mock(use_lm=False):
     print(f"\nLoss (chi^2 / pixel) at TRUE parameters: {true_loss:.4f} "
           f"(should be ~1)")
 
+    # Cross-check: what does the LM fitter see at the true parameters?
+    # This uses the EXACT same residual function that optimistix internally
+    # builds (band-grouped, padded, flattened), so any discrepancy vs
+    # compute_loss above points to a mismatch between the two code paths.
+    lm_true_loss = compute_lm_loss(
+        inf_exposures, true_log_params, true_log_backgrounds,
+        n_lambda=N_LAMBDA, oversampling=2,
+    )
+    total_pixels = sum(np.asarray(m).size for m, *_ in inf_exposures)
+    raw_optx = 0.5 * total_pixels * lm_true_loss
+    print(f"LM loss (chi^2 / pixel) at TRUE parameters: {lm_true_loss:.4f} "
+          f"(raw optimistix: {raw_optx:.1f})")
+    if abs(lm_true_loss - true_loss) > 0.01:
+        print(f"  ⚠ MISMATCH vs compute_loss ({true_loss:.4f}) — "
+              f"difference {lm_true_loss - true_loss:.4f}")
+
     # ---- loss at the INITIAL GUESS, before optimisation ---------------------
     # (independent of whether --lm is set) - uses the same background
     # initialisation convention as infer_parameters/infer_parameters_lm
@@ -672,7 +689,7 @@ def end_to_end_mock(use_lm=False):
             init_log_params,
             n_steps=512,
             learning_rate=5e-2,
-            momentum=0.0,
+            momentum=0.3,
             warmup_steps=16,
             n_lambda=N_LAMBDA,
             oversampling=2,

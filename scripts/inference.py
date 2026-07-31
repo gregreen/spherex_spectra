@@ -251,6 +251,55 @@ def _make_residual_fn(exposures, n_lambda, oversampling):
     return residuals
 
 
+def compute_lm_loss(
+    exposures, log_params, log_backgrounds, n_lambda=5, oversampling=2,
+):
+    """Loss value that the Levenberg-Marquardt fitter sees, normalised
+    to chi² / pixel, computed through the **exact same** residual function
+    used internally by :func:`infer_parameters_lm`.
+
+    This builds a fresh :func:`_make_residual_fn` (the same band-grouped,
+    padded, flattened residual builder that LM optimises over), evaluates
+    it at the given parameters, and returns ``sum(residuals²) / n_pixels``
+    — i.e. the same quantity that :func:`compute_loss` returns, but
+    computed through the LM residual path for consistency checks.
+
+    The raw ``optimistix`` loss (printed per-step when ``verbose=True``)
+    is ``0.5 * sum(residuals²)``.  To cross-reference::
+
+        raw_optx_loss = 0.5 * n_pixels * compute_lm_loss(...)
+
+    Parameters
+    ----------
+    exposures : list of (mean_img, sigma_img, positions_pix,
+                         gen_module, half_stamp, source_idx)
+        Same format as accepted by :func:`infer_parameters_lm`.
+    log_params : (S, P) array
+        Log-parameters [log(T/kK), log(A/(W/m2/um))].
+    log_backgrounds : (E,) array
+        Log-background (rate, s^-1) per exposure.
+    n_lambda : int
+        Wavelength-integration samples (must match the LM fit).
+    oversampling : int
+        Sub-pixel oversampling factor (must match the LM fit).
+
+    Returns
+    -------
+    float
+        ``chi² / n_pixels`` — ~1.0 at the true parameters if the noise
+        model is correctly specified.
+    """
+    residuals_fn = _make_residual_fn(exposures, n_lambda, oversampling)
+    log_params_j = jnp.asarray(log_params, dtype=jnp.float32)
+    log_backgrounds_j = jnp.asarray(log_backgrounds, dtype=jnp.float32)
+    r = residuals_fn((log_params_j, log_backgrounds_j))
+    sumsq = jnp.sum(r ** 2)
+    total_pixels = float(sum(
+        m.shape[0] * m.shape[1] for m, *_ in exposures
+    ))
+    return float(sumsq / total_pixels)
+
+
 # ---------------------------------------------------------------------------
 # Single fully-jitted training step
 # ---------------------------------------------------------------------------

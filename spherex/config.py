@@ -51,7 +51,7 @@ _BANDS = {
 }
 
 
-def _build_band(band, psf_scale=1.0):
+def _build_band(band, psf_scale=1.0, lambda_slope_scale=1.0):
     """Build PSF, transmission, spectrum model, and aperture for a band.
 
     Parameters
@@ -60,6 +60,12 @@ def _build_band(band, psf_scale=1.0):
         SPHEREx band number (1-6).
     psf_scale : float, optional
         Factor by which to scale the PSF FWHM (default 1).
+    lambda_slope_scale : float, optional
+        Factor by which to scale the wavelength gradient (um/arcsec)
+        of the linear variable filter (default 1).  Set to the
+        downsampling factor when the detector image has been binned
+        so that the wavelength range across the (fewer) pixels matches
+        the full un-binned detector.
 
     Returns
     -------
@@ -80,7 +86,7 @@ def _build_band(band, psf_scale=1.0):
     # ---- filter transmission -----------------------------------------------
     # LVF: lambda_c(y) = lambda_intercept + lambda_slope * y
     lambda_intercept = lam_min
-    lambda_slope = (lam_max - lam_min) / _DETECTOR_ARCSEC   # um / arcsec
+    lambda_slope = (lam_max - lam_min) / _DETECTOR_ARCSEC * lambda_slope_scale   # um / arcsec
 
     # R = lambda / FWHM;  FWHM = 2*sqrt(2*ln(2))*sigma ~ 2.355*sigma
     lam_mid = 0.5 * (lam_min + lam_max)
@@ -141,9 +147,11 @@ class SpherexImageGenerator(ImageGenerator):
         image_height=_DETECTOR_PIXELS,
         pixel_scale=_PIXEL_SCALE,
         psf_scale=1.0,
+        lambda_slope_scale=1.0,
     ):
         psf, transmission, spectrum_model, aperture = _build_band(
-            band, psf_scale=psf_scale
+            band, psf_scale=psf_scale,
+            lambda_slope_scale=lambda_slope_scale,
         )
 
         super().__init__(
@@ -219,9 +227,11 @@ class SpherexImageGenerator3(ImageGenerator3):
         image_height=_DETECTOR_PIXELS,
         pixel_scale=_PIXEL_SCALE,
         psf_scale=1.0,
+        lambda_slope_scale=1.0,
     ):
         psf, transmission, spectrum_model, aperture = _build_band(
-            band, psf_scale=psf_scale
+            band, psf_scale=psf_scale,
+            lambda_slope_scale=lambda_slope_scale,
         )
 
         super().__init__(
