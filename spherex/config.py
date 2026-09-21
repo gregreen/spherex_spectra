@@ -99,6 +99,11 @@ def _build_band(band, psf_scale=1.0, lambda_slope_scale=1.0):
     )
 
     # ---- spectrum ----------------------------------------------------------
+    # Shape-only blackbody template.  The amplitude is NOT part of the
+    # spectrum model: it is carried as the first column of ``source_params``
+    # and applied by the image generator (see ``spherex.spectrum``).  The
+    # reference wavelength is the single global constant ``LAMBDA_0`` (never
+    # band-specific) so the modelled spectrum stays smooth across bands.
     spectrum_model = BlackbodySpectrum()
 
     return psf, transmission, spectrum_model, _APERTURE
@@ -180,8 +185,9 @@ class SpherexImageGenerator(ImageGenerator):
         ----------
         source_positions : (S, 2) array
             Source positions in arcsec (origin at bottom-left of pixel (0,0)).
-        source_params : (S, P) array
-            Per-source spectrum parameters.
+        source_params : (S, 1 + P) array
+            Per-source parameters: log-amplitude in the first column, then the
+            spectrum-shape parameters (passed to the spectrum model).
         postage_stamp_half_size : int
             Half-size of the postage stamp in pixels.
         n_wavelength_samples : int
@@ -261,8 +267,9 @@ class SpherexImageGenerator3(ImageGenerator3):
         ----------
         source_positions : (S, 2) array
             Source positions in arcsec (origin at bottom-left of pixel (0,0)).
-        source_params : (S, P) array
-            Per-source spectrum parameters.
+        source_params : (S, 1 + P) array
+            Per-source parameters: log-amplitude in the first column, then the
+            spectrum-shape parameters (passed to the spectrum model).
         postage_stamp_half_size : int
             Half-size of the postage stamp in pixels.
         n_wavelength_samples : int

@@ -25,6 +25,7 @@ from PIL import Image
 from spherex import SpherexImageGenerator, SpherexImageGenerator3, BlackbodySpectrum
 from spherex.config import _BANDS
 from spherex.constants import HC_JAX, TEMPERATURE_UNIT
+from spherex.spectrum import LAMBDA_0
 from spherex.plotting_utils import HistEqNormalize
 from jax.scipy.integrate import trapezoid
 import sys
@@ -63,6 +64,16 @@ CATALOG_RADIUS = 3.5 / DOWNSAMPLE          # degrees  (spherical cap radius)
 # Power-law index for source amplitudes
 AMPLITUDE_ALPHA = 1.5          # P(A) ∝ A^{-alpha}
 
+# Source amplitude range, specified DIRECTLY on the physical flux-density
+# scale f_lambda(LAMBDA_0) in W m^-2 um^-1 (LAMBDA_0 = 1 um; see
+# ``spherex.spectrum``).  There is NO photon-count targeting: amplitudes are
+# drawn from this range (power-law P(A) ∝ A^-alpha) and the resulting photon
+# counts are only *reported* as a diagnostic - see ``_report_photon_counts``.
+# The values below correspond to roughly 1e2 .. 5e6 detected photons per
+# exposure for a T = 3000 K source in a mid SPHEREx band.
+AMPLITUDE_MIN = 1.0e-15
+AMPLITUDE_MAX = 5.0e-11
+
 # PNG percentile clipping
 PNG_PERCENTILE_LO = 0.2
 PNG_PERCENTILE_HI = 99.8
@@ -82,60 +93,60 @@ BACKGROUND_FACTOR = 2.0  # >1 makes faintest stars below background
 N_LAMBDA = 1
 
 # ---------------------------------------------------------------------------
-# Step 1: Estimate amplitude limits
+# Step 1: Amplitude range + photon-count diagnostic
 # ---------------------------------------------------------------------------
+# Amplitudes are drawn directly in [AMPLITUDE_MIN, AMPLITUDE_MAX] (defined in
+# the configuration block above).  There is no photon-count *targeting*;
+# instead we report the detected counts implied by the chosen range.
 
-def _estimate_amplitude_limits():
-    """Compute A_min, A_max so that a T=3000 K blackbody produces
-    ~100 to ~5e6 detected photons per exposure over a representative
-    SPHEREx band (Band 3, 1.63–2.41 um)."""
-    lam_min, lam_max, _R, _name = _BANDS[3]
+def _total_photons_per_exposure(band, amplitude, temperature_kK=3.0):
+    """Analytic detected photons per exposure for a blackbody source.
 
-    # Dense wavelength grid for integration
-    n_lam = 500
-    lambdas = jnp.linspace(lam_min, lam_max, n_lam)
-    dlam = lambdas[1] - lambdas[0]
+    Integrates the telescope-collected photon rate over the band, including
+    the Gaussian filter transmission, and multiplies by ``EXPOSURE_TIME``.
+    ``amplitude`` is f_lambda at LAMBDA_0 (W m^-2 um^-1).  Used only as a
+    diagnostic and to set the background level.
+    """
+    lam_min, lam_max, R, _name = _BANDS[band]
+    lambdas = jnp.linspace(lam_min, lam_max, 500)
+    lam_mid = 0.5 * (lam_min + lam_max)
+    sigma_t = lam_mid / (2.0 * jnp.sqrt(2.0 * jnp.log(2.0)) * R)
+    T_weight = jnp.exp(-(lambdas - lam_mid) ** 2 / (2.0 * sigma_t ** 2))
 
-    # Blackbody at T = 3 kK, amplitude = 1
-    bb = BlackbodySpectrum()
-    T_ref = (3000 * u.K).to(u.Unit(TEMPERATURE_UNIT)).value   # 3.0
-    params = jnp.array([np.log(T_ref), 0.0])  # log-space
-    f_lam = bb(lambdas, params)                        # W / (m^2 um)
+    shape = BlackbodySpectrum()(
+        lambdas, jnp.array([jnp.log(temperature_kK)])
+    )
+    f_lam = amplitude * shape
 
-    # Photon rate per unit amplitude  [s^{-1}]
-    #   aperture * ∫ (lambda / hc) * f_lambda(lambda) d_lambda
-    aperture = jnp.pi * (0.10) ** 2                    # m^2
-    integrand = (lambdas / HC_JAX) * f_lam             # s^{-1} m^{-2} um^{-1}  ???  actually photons/s per (m^2 um)
-    rate_per_amp = float(aperture * trapezoid(integrand, lambdas))  # s^{-1}
+    aperture = jnp.pi * (0.10) ** 2
+    rate = aperture * trapezoid((lambdas / HC_JAX) * f_lam * T_weight, lambdas)
+    return float(rate) * EXPOSURE_TIME
 
-    photons_per_sec_per_amp = rate_per_amp
-    photons_per_exp_per_amp = photons_per_sec_per_amp * EXPOSURE_TIME
 
-    target_bright = 5.0e6
-    target_faint = 100.0
-
-    A_max = target_bright / photons_per_exp_per_amp
-    A_min = target_faint / photons_per_exp_per_amp
-
-    print(f"Photons / s per unit amplitude (T=3000K): {photons_per_sec_per_amp:.4e}")
-    print(f"Photons / exposure per unit amplitude:     {photons_per_exp_per_amp:.4e}")
-    print(f"A_min = {A_min:.4e}  (~{target_faint:.0f} photons)")
-    print(f"A_max = {A_max:.4e}  (~{target_bright:.0f} photons)")
-
-    return A_min, A_max
+def _report_photon_counts():
+    """Print the photon-count range implied by AMPLITUDE_MIN/AMPLITUDE_MAX."""
+    print("\n--- Amplitude range (specified directly, no count targeting) ---")
+    print(f"  f_lambda(LAMBDA_0={LAMBDA_0} um) in "
+          f"[{AMPLITUDE_MIN:.3e}, {AMPLITUDE_MAX:.3e}] W m^-2 um^-1")
+    for band in sorted(_BANDS):
+        lo = _total_photons_per_exposure(band, AMPLITUDE_MIN)
+        hi = _total_photons_per_exposure(band, AMPLITUDE_MAX)
+        print(f"  Band {band}: {lo:10.1f} - {hi:12.1f} photons / exposure "
+              f"(T = 3000 K)")
 
 
 # ---------------------------------------------------------------------------
 # Step 2: Generate source catalog
 # ---------------------------------------------------------------------------
 
-def _generate_catalog(A_min, A_max, rng, ra_center=None, dec_center=None,
+def _generate_catalog(rng, ra_center=None, dec_center=None,
                        radius_deg=None):
-    """Return (skycoords, temperatures, amplitudes).
+    """Return (skycoords, log_temperatures, log_amplitudes).
 
     Sources are drawn uniformly from the surface of a sphere within a
     spherical cap of radius ``radius_deg`` centred on (``ra_center``,
-    ``dec_center``).
+    ``dec_center``).  Amplitudes are power-law distributed (P(A) ∝ A^-alpha)
+    over the directly-specified range [AMPLITUDE_MIN, AMPLITUDE_MAX].
     """
     if ra_center is None:
         ra_center = CATALOG_CENTER.ra.deg
@@ -168,12 +179,12 @@ def _generate_catalog(A_min, A_max, rng, ra_center=None, dec_center=None,
     # Amplitudes: truncated power-law  P(A) ∝ A^{-alpha}
     alpha = AMPLITUDE_ALPHA
     u_vals = rng.uniform(0.0, 1.0, N_SOURCES)
-    # Inverse CDF for A^{-alpha} on [A_min, A_max]
+    # Inverse CDF for A^{-alpha} on [AMPLITUDE_MIN, AMPLITUDE_MAX]:
     #   CDF(A) = (A^{1-alpha} - A_min^{1-alpha}) / (A_max^{1-alpha} - A_min^{1-alpha})
     #   => A = [A_min^{1-alpha} + u * (A_max^{1-alpha} - A_min^{1-alpha})]^{1/(1-alpha)}
     exp = 1.0 - alpha
-    A_min_exp = A_min ** exp
-    A_max_exp = A_max ** exp
+    A_min_exp = AMPLITUDE_MIN ** exp
+    A_max_exp = AMPLITUDE_MAX ** exp
     amplitudes = (A_min_exp + u_vals * (A_max_exp - A_min_exp)) ** (1.0 / exp)
     log_amplitudes = np.log(amplitudes)
 
@@ -267,11 +278,11 @@ def _filter_sources(skycoords, log_temperatures, log_amplitudes, exposures):
         positions_pix = jnp.stack(
             [jnp.asarray(x_px), jnp.asarray(y_px)], axis=-1
         )
-
+        # source_params = [log_amplitude, log_temperature]  (amplitude FIRST)
         params = jnp.stack(
             [
-                jnp.asarray(log_temperatures[in_this], dtype=jnp.float32),
                 jnp.asarray(log_amplitudes[in_this], dtype=jnp.float32),
+                jnp.asarray(log_temperatures[in_this], dtype=jnp.float32),
             ],
             axis=-1,
         )
@@ -297,11 +308,11 @@ def _filter_sources(skycoords, log_temperatures, log_amplitudes, exposures):
 # ---------------------------------------------------------------------------
 
 
-def _compute_background(band, A_min):
-    """Estimate background level so A_min stars are slightly below it.
+def _compute_background(band):
+    """Estimate the background level so the faintest stars sit below it.
 
-    Computes the approximate peak pixel rate for a T=3000 K blackbody
-    with amplitude ``A_min`` at the band-centre wavelength, then scales
+    Computes the approximate peak pixel rate for a T=3000 K blackbody with
+    amplitude ``AMPLITUDE_MIN`` at the band-centre wavelength, then scales
     by ``BACKGROUND_FACTOR``.
     """
     lam_min, lam_max, R, _name = _BANDS[band]
@@ -312,11 +323,13 @@ def _compute_background(band, A_min):
     sigma_psf = fwhm / (2.0 * np.sqrt(2.0 * np.log(2.0)))  # arcsec
     psf_peak = 1.0 / (2.0 * np.pi * sigma_psf**2)  # arcsec^-2
 
-    # Blackbody flux at band centre
+    # Flux density at band centre: amplitude (f_lambda at LAMBDA_0) times the
+    # dimensionless blackbody *shape*.
     bb = BlackbodySpectrum()
     lam_arr = jnp.array([lam_mid])
-    params = jnp.array([np.log((3000 * u.K).to(u.Unit(TEMPERATURE_UNIT)).value), np.log(A_min)])
-    f_lam = float(bb(lam_arr, params)[0])       # W / (m^2 um)
+    T_ref = (3000 * u.K).to(u.Unit(TEMPERATURE_UNIT)).value
+    shape = bb(lam_arr, jnp.array([np.log(T_ref)]))
+    f_lam = float(AMPLITUDE_MIN * shape[0])       # W / (m^2 um)
 
     # Effective bandwidth of the Gaussian transmission
     # sigma = lambda_mid / (2.355 * R)
@@ -341,7 +354,7 @@ def _compute_background(band, A_min):
     return background
 
 
-def _generate_and_save(per_exposure_data, A_min):
+def _generate_and_save(per_exposure_data):
     """For each exposure, generate an image (timed) and save as PNG.
 
     Returns
@@ -393,7 +406,7 @@ def _generate_and_save(per_exposure_data, A_min):
         # same way - previously only the background was, which
         # systematically under-counted the source flux relative to a
         # correctly-scaled background).
-        bg = _compute_background(band, A_min)
+        bg = _compute_background(band)
         img_with_bg = (img_np + bg) * EXPOSURE_TIME
         # img_noisy = np.random.default_rng(i).poisson(img_with_bg)
         # sigma should reflect the TRUE Poisson variance of the simulated
@@ -520,14 +533,14 @@ def end_to_end_mock(use_lm=False):
     print("SPHEREx Mock Exposure Simulation")
     print("=" * 60)
 
-    # ---- Step 1: amplitude limits -----------------------------------------
-    print("\n--- Step 1: Estimating amplitude limits ---")
-    A_min, A_max = _estimate_amplitude_limits()
+    # ---- Step 1: amplitude range + photon-count diagnostic ----------------
+    print("\n--- Step 1: Amplitude range ---")
+    _report_photon_counts()
 
     # ---- Step 2: catalog --------------------------------------------------
     print("\n--- Step 2: Generating source catalog ---")
     rng = np.random.default_rng(42)
-    skycoords, log_temperatures, log_amplitudes = _generate_catalog(A_min, A_max, rng)
+    skycoords, log_temperatures, log_amplitudes = _generate_catalog(rng)
     print(f"  Generated {N_SOURCES} sources")
     print(f"  T range: [{np.exp(log_temperatures).min():.1f}, "
           f"{np.exp(log_temperatures).max():.1f}] kK")
@@ -564,7 +577,7 @@ def end_to_end_mock(use_lm=False):
     # ---- Step 5 + 6: generate & save ---------------------------------------
     print("\n--- Steps 5 & 6: Generating and saving images ---")
     inf_exposures, noisy_vmins, noisy_vmaxs = _generate_and_save(
-        per_exposure_data, A_min
+        per_exposure_data
     )
 
     # ---- Step 7: inference -------------------------------------------------
@@ -578,8 +591,10 @@ def end_to_end_mock(use_lm=False):
     # unfiltered catalog) - indexing with a filtered/compacted array here
     # would silently select the wrong source's parameters for most
     # sources.
+    # Parameter layout is [log_amplitude, log_temperature]: the amplitude is
+    # ALWAYS the first column (see ``spherex.spectrum``).
     true_log_params = np.column_stack([
-        log_temperatures, log_amplitudes
+        log_amplitudes, log_temperatures
     ]).astype(np.float32)
 
     # Initial guess: random values within the prior bounds
@@ -587,13 +602,13 @@ def end_to_end_mock(use_lm=False):
     ln_teff_bounds = np.log(([3000.,8000.] * u.K).to(u.Unit(TEMPERATURE_UNIT)).value)
     init_log_params = np.column_stack([
         rng_inf.uniform(
+            np.log(AMPLITUDE_MIN), np.log(AMPLITUDE_MAX),
+            true_log_params.shape[0]
+        ),
+        rng_inf.uniform(
             ln_teff_bounds[0],
             ln_teff_bounds[1],
             true_log_params.shape[0],
-        ),
-        rng_inf.uniform(
-            np.log(A_min), np.log(A_max),
-            true_log_params.shape[0]
         ),
     ]).astype(np.float32)
 
@@ -608,7 +623,7 @@ def end_to_end_mock(use_lm=False):
     # model or in how the noise / sigma was generated, rather than an
     # optimisation failure.
     true_log_backgrounds = np.log([
-        _compute_background(band, A_min) for _, _, band, _, _, _ in per_exposure_data
+        _compute_background(band) for _, _, band, _, _, _ in per_exposure_data
     ]).astype(np.float32)
     # NOTE: n_lambda must match the ``n_wavelength_samples`` used when
     # generating the images (N_LAMBDA, see ``_generate_and_save``) - using
@@ -700,6 +715,9 @@ def end_to_end_mock(use_lm=False):
             n_lambda=N_LAMBDA,
             oversampling=2,
             precondition_rms=True,
+            # Interleave direct amplitude least-squares solves with SGD
+            # (default amp_solve_every=10).
+            amp_verbose=True,
         )
 
     # ---- loss at the RECOVERED parameters -----------------------------------
@@ -798,7 +816,7 @@ def end_to_end_mock(use_lm=False):
     #    and just added the same whole-catalog check unconditionally on
     #    every loop iteration, regardless of which sources were actually
     #    observed in that exposure.
-    true_A = np.exp(true_log_params[:, 1])
+    true_A = np.exp(true_log_params[:, 0])
     n_above = np.zeros(true_log_params.shape[0], dtype=int)
     for k, (_noisy, _sigma, _pos, _gen, _hs, src_idx) in enumerate(inf_exposures):
         idx = np.asarray(src_idx)
@@ -872,10 +890,7 @@ def compare_n_lambda(n_lambda_values=(1, 3, 15, 63), oversampling=2,
     print("=" * 60)
 
     rng = np.random.default_rng(42)
-    A_min, A_max = _estimate_amplitude_limits()
-    skycoords, log_temperatures, log_amplitudes = _generate_catalog(
-        A_min, A_max, rng
-    )
+    skycoords, log_temperatures, log_amplitudes = _generate_catalog(rng)
     exposures = _generate_exposures(rng)
     _, _, _, per_exposure_data = _filter_sources(
         skycoords, log_temperatures, log_amplitudes, exposures
@@ -981,10 +996,7 @@ def run_benchmark(n_repeats=5, source_batch_sizes=(None, 8, 32)):
     print("=" * 60)
 
     rng = np.random.default_rng(42)
-    A_min, A_max = _estimate_amplitude_limits()
-    skycoords, log_temperatures, log_amplitudes = _generate_catalog(
-        A_min, A_max, rng
-    )
+    skycoords, log_temperatures, log_amplitudes = _generate_catalog(rng)
     exposures = _generate_exposures(rng)
     _, _, _, per_exposure_data = _filter_sources(
         skycoords, log_temperatures, log_amplitudes, exposures
@@ -1019,12 +1031,16 @@ def run_benchmark(n_repeats=5, source_batch_sizes=(None, 8, 32)):
         n_src = params.shape[0]
         base_T = np.asarray(params[:, 0])
         base_A = np.asarray(params[:, 1])
+        # source_params layout is [log_amplitude, log_temperature].
+        n_src = params.shape[0]
+        base_A = np.asarray(params[:, 0])
+        base_T = np.asarray(params[:, 1])
 
         ref_img = None
         for rep in range(n_repeats):
-            dT, dA = _perturb_params(base_T, base_A, perturb_rng)
+            pT, pA = _perturb_params(base_T, base_A, perturb_rng)
             p = jnp.stack(
-                [jnp.asarray(dT, jnp.float32), jnp.asarray(dA, jnp.float32)],
+                [jnp.asarray(pA, jnp.float32), jnp.asarray(pT, jnp.float32)],
                 axis=-1,
             )
 
@@ -1072,10 +1088,10 @@ def run_benchmark(n_repeats=5, source_batch_sizes=(None, 8, 32)):
 
     # ---- Part 2: inference timing ----------------------------------------
     print("\n--- Inference: batched=False vs batched=True ---")
-    inf_exposures, _, _ = _generate_and_save(per_exposure_data, A_min)
+    inf_exposures, _, _ = _generate_and_save(per_exposure_data)
 
     init_log_params = np.column_stack(
-        [log_temperatures, log_amplitudes]
+        [log_amplitudes, log_temperatures]
     ).astype(np.float32)
     init_log_params += 0.05 * np.random.default_rng(1).standard_normal(
         init_log_params.shape

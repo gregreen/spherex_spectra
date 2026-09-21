@@ -50,10 +50,10 @@ class ImageGenerator3(eqx.Module):
     spectrum_model: eqx.Module
     aperture: float
 
-    def __call__(
+    def _stamp_batch(
         self,
         source_positions: jnp.ndarray,      # (S, 2)  [pixel coords]
-        source_params: jnp.ndarray,         # (S, P)
+        source_params: jnp.ndarray,         # (S, 1 + P)  [log_amplitude, ...]
         image_width: int,
         image_height: int,
         pixel_scale: float,
@@ -61,12 +61,21 @@ class ImageGenerator3(eqx.Module):
         n_wavelength_samples: int,
         oversampling: int = 1,
         source_batch_size: int | None = None,
-    ) -> jnp.ndarray:
-        """
+    ):
+        """Compute per-source postage stamps and their pixel indices.
+
+        Unlike :meth:`__call__`, this does NOT scatter-add the stamps into a
+        full image - it returns them individually.  Used to build the
+        diagonal (Jacobi) preconditioner for the direct amplitude
+        least-squares solve in ``scripts.inference``.
+
         Returns
         -------
-        jnp.ndarray, shape ``(image_height, image_width)``
-            Photon detection rate per pixel in s⁻¹.
+        stamps : jnp.ndarray, shape ``(S, stamp_size, stamp_size)``
+            Each source's contribution in s⁻¹-already-scaled-by-``aperture *
+            pixel_scale²`` rate units, masked to zero outside the detector.
+        i_all, j_all : jnp.ndarray, shape ``(S, stamp_size, stamp_size)``
+            Clipped pixel indices for the scatter-add.
         """
         half = postage_stamp_half_size
         stamp_size = 2 * half + 1
@@ -137,9 +146,61 @@ class ImageGenerator3(eqx.Module):
         )
         # stamps: (S, stamp_size, stamp_size)
         # i_all, j_all: (S, stamp_size, stamp_size)
+        return stamps, i_all, j_all
+
+    def __call__(
+        self,
+        source_positions: jnp.ndarray,      # (S, 2)  [pixel coords]
+        source_params: jnp.ndarray,         # (S, 1 + P)  [log_amplitude, ...]
+        image_width: int,
+        image_height: int,
+        pixel_scale: float,
+        postage_stamp_half_size: int,
+        n_wavelength_samples: int,
+        oversampling: int = 1,
+        source_batch_size: int | None = None,
+    ) -> jnp.ndarray:
+        """
+        Returns
+        -------
+        jnp.ndarray, shape ``(image_height, image_width)``
+            Photon detection rate per pixel in s⁻¹.
+        """
+        stamps, i_all, j_all = self._stamp_batch(
+            source_positions, source_params,
+            image_width, image_height, pixel_scale,
+            postage_stamp_half_size, n_wavelength_samples,
+            oversampling=oversampling, source_batch_size=source_batch_size,
+        )
 
         # ---- single vectorised scatter-add -----------------------------------
         image = jnp.zeros((image_height, image_width))
         image = image.at[i_all, j_all].add(stamps)
 
         return image
+
+    def source_stamps(
+        self,
+        source_positions: jnp.ndarray,
+        source_params: jnp.ndarray,
+        image_width: int,
+        image_height: int,
+        pixel_scale: float,
+        postage_stamp_half_size: int,
+        n_wavelength_samples: int,
+        oversampling: int = 1,
+        source_batch_size: int | None = None,
+    ):
+        """Public wrapper around :meth:`_stamp_batch`.
+
+        Returns the per-source ``(stamps, i_all, j_all)`` triple so that
+        callers (e.g. the direct amplitude least-squares solver) can build
+        per-source quadratic forms such as the Jacobi preconditioner diagonal
+        without re-implementing the postage-stamp machinery.
+        """
+        return self._stamp_batch(
+            source_positions, source_params,
+            image_width, image_height, pixel_scale,
+            postage_stamp_half_size, n_wavelength_samples,
+            oversampling=oversampling, source_batch_size=source_batch_size,
+        )

@@ -2,7 +2,13 @@
 
 from .constants import (H, C, HC, KB, H_JAX, C_JAX, HC_JAX, KB_JAX,
                          TEMPERATURE_UNIT, WAVELENGTH_UNIT)
-from .spectrum import BlackbodySpectrum
+from .spectrum import (
+    BlackbodySpectrum,
+    LAMBDA_0,
+    LOG_AMPLITUDE_INDEX,
+    split_source_params,
+    join_source_params,
+)
 from .psf import GaussianPSF
 from .transmission import GaussianFilterTransmission
 from .image import ImageGenerator, photon_rate_per_pixel, _subpixel_centers
@@ -15,6 +21,10 @@ __all__ = [
     "H_JAX", "C_JAX", "HC_JAX", "KB_JAX",
     "TEMPERATURE_UNIT", "WAVELENGTH_UNIT",
     "BlackbodySpectrum",
+    "LAMBDA_0",
+    "LOG_AMPLITUDE_INDEX",
+    "split_source_params",
+    "join_source_params",
     "GaussianPSF",
     "GaussianFilterTransmission",
     "ImageGenerator",

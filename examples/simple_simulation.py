@@ -18,6 +18,7 @@ from spherex import (
     GaussianFilterTransmission,
     ImageGenerator,
 )
+from spherex.constants import TEMPERATURE_UNIT
 
 
 def main():
@@ -57,11 +58,14 @@ def main():
         [30.0, 40.0],
     ])
 
-    # Each row: [temperature (kK), amplitude (W m^-2 um^-1)]
+    # Each row: [log-amplitude, log-temperature (kK)].
+    # The spectrum model is a *shape* template normalised to f_lambda = 1 at
+    # LAMBDA_0 (1 um); the amplitude (f_lambda at LAMBDA_0, W m^-2 um^-1) is
+    # carried separately as the FIRST parameter (see ``spherex.spectrum``).
     source_params = jnp.log(jnp.array([
-        [(5778 * u.K).to(u.Unit(TEMPERATURE_UNIT)).value, 1e-12],    # Sun-like
-        [(3500 * u.K).to(u.Unit(TEMPERATURE_UNIT)).value, 2e-12],    # Cool star
-        [(10000 * u.K).to(u.Unit(TEMPERATURE_UNIT)).value, 5e-13],   # Hot star
+        [1e-13, (5778 * u.K).to(u.Unit(TEMPERATURE_UNIT)).value],   # Sun-like
+        [2e-13, (3500 * u.K).to(u.Unit(TEMPERATURE_UNIT)).value],   # Cool star
+        [5e-14, (10000 * u.K).to(u.Unit(TEMPERATURE_UNIT)).value],  # Hot star
     ]))
 
     # ------------------------------------------------------------------
@@ -125,7 +129,7 @@ def main():
 
     def total_flux(T1):
         """Total image flux as a function of the first source's temperature."""
-        p = source_params.at[0, 0].set(T1)
+        p = source_params.at[0, 1].set(T1)   # column 1 is log-temperature
         return jnp.sum(
             generator(
                 source_positions, p,
@@ -135,7 +139,7 @@ def main():
             )
         )
 
-    T0 = float(source_params[0, 0])
+    T0 = float(source_params[0, 1])
     grad = jax.grad(total_flux)(T0)
     print(f"Temperature of source 0    : {T0:.0f} K")
     print(f"d(total flux) / d(T)       : {grad:.4e} s^-1 K^-1")

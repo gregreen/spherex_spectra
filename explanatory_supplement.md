@@ -46,9 +46,14 @@ All constants (`HC`, `KB`, etc.) are derived from `astropy.constants` and conver
 
 A source at position $(x_s, y_s)$ on the sky (denoted $\Omega_s = (x_s, y_s)$ in arcsec) has a spectral flux density
 
-$$f_\lambda(\lambda; T, A) = \frac{A}{\text{sr}} \cdot B_\lambda(\lambda, T)$$
+$$f_\lambda(\lambda; T, A) = A \cdot \hat{B}_\lambda(\lambda, T), \qquad
+\hat{B}_\lambda(\lambda, T) = \frac{B_\lambda(\lambda, T)}{B_\lambda(\lambda_0, T)}$$
 
-where $B_\lambda$ is the Planck function and $A$ absorbs the solid-angle factor. The free parameters are $\log_{10}(T/\text{kK})$ and $\log_{10}(A / \text{W m}^{-2} \text{µm}^{-1})$, stored in log-space to enforce positivity and improve optimizer conditioning.
+where $B_\lambda$ is the Planck function and $\lambda_0$ is a single **global** reference wavelength (`LAMBDA_0 = 1.0 µm` in `spherex/spectrum.py`) shared by every band — so the modelled spectrum stays smooth in amplitude across the whole wavelength range. The spectrum model returns only the dimensionless *shape* $\hat{B}_\lambda$, which equals exactly 1 at $\lambda_0$.
+
+**Amplitude is not part of the spectrum model.** It is carried as a separate per-source parameter, always the **first** column of `source_params` (`LOG_AMPLITUDE_INDEX = 0`). The image generator applies it as $\exp(\texttt{source\_params}[:, 0])$ and passes only `source_params[:, 1:]` to the spectrum model. Because $A = f_\lambda(\lambda_0)$ is a physical flux density, $\log A$ has a direct interpretation. All parameters are stored in log-space to enforce positivity and improve optimizer conditioning.
+
+`BlackbodySpectrum` therefore has a single free parameter, $\log(T/\text{kK})$. Crucially, the forward model is **exactly linear in the amplitude** $a = \exp(\log A)$ — a source's contribution is just $a$ times its unit-amplitude postage stamp — which is what makes the direct amplitude least-squares solve of §5.5 possible.
 
 ### 2.2 PSF
 
@@ -118,8 +123,9 @@ All models are `equinox.Module` subclasses in `spherex/`. They store hyperparame
 
 ### 3.1 `BlackbodySpectrum` (`spherex/spectrum.py`)
 
-- **Attributes**: `n_params = 2` (log-T, log-A)
-- **`__call__(wavelength, params)`**: returns $f_\lambda$ in W m⁻² µm⁻¹
+- **Attributes**: `lambda_0` (reference wavelength, defaulting to the global `LAMBDA_0 = 1.0 µm`), `n_params = 1` (log-T only — the amplitude lives *outside* the model)
+- **`__call__(wavelength, shape_params)`**: returns the dimensionless shape $\hat{B}_\lambda = B_\lambda(\lambda,T)/B_\lambda(\lambda_0,T)$, which is exactly 1 at $\lambda_0$. Physical flux density is $\exp(\log A)\cdot\hat{B}_\lambda$.
+- **Layout helpers**: `LOG_AMPLITUDE_INDEX`, `split_source_params`, `join_source_params` define the `[log_amplitude, shape…]` convention in one place
 - **Implementation detail**: uses `inv_T_scale = HC/(λ·KB)` to avoid float32 underflow in the Planck gradient
 
 ### 3.2 `GaussianPSF` (`spherex/psf.py`)
@@ -142,7 +148,7 @@ All models are `equinox.Module` subclasses in `spherex/`. They store hyperparame
 
 - `ImageGenerator`: iterates over sources via `jax.lax.scan`, computing one postage stamp at a time
 - `ImageGenerator3`: uses `jax.lax.map(..., batch_size=...)` for chunked parallel processing, then a single vectorized scatter-add — faster but functionally identical
-
+ `source_params` has shape `(S, 1 + P)`: column 0 is the log-amplitude, and the remaining columns are passed to the spectrum model as its shape parameters. `ImageGenerator3` additionally exposes `source_stamps(...)`, returning the per-source postage stamps (before scatter-add) so callers can build per-source quadratic forms such as the amplitude-solve preconditioner diagonal.
 Both accept the same `__call__` signature: `(source_positions, source_params, image_width, image_height, pixel_scale, postage_stamp_half_size, n_wavelength_samples, oversampling)`.
 
 ### 3.5 Pre-configured generators (`spherex/config.py`)
@@ -183,7 +189,7 @@ SpherexImageGenerator3.__call__()
 
 ## 5. Parameter Inference
 
-Inference is in `scripts/inference.py`. Two optimizers are available.
+Inference is in `scripts/inference.py`. Two optimizers are available (SGD and Levenberg–Marquardt), plus a **direct amplitude least-squares solve** (§5.5) that exploits the exact linearity of the model in the source amplitude and is interleaved with SGD by default.
 
 ### 5.1 Shared infrastructure
 
@@ -224,7 +230,31 @@ Phase 2: LM warm-started from SGD-refined params and backgrounds, with `initial_
 
 This prevents the first Gauss-Newton step from overshooting when starting from a random initialization, which is a fundamental problem with exponentiated parameterizations.
 
-### 5.5 Diagnostic: `compute_lm_loss`
+### 5.5 Direct amplitude least-squares solve + SGD interlace (`solve_log_amplitudes`)
+
+Because the forward model is exactly **linear** in the per-source amplitude $a = \exp(\log A)$ (see §2.1) — a source contributes $a$ times its fixed unit-amplitude postage stamp — finding the optimal amplitude of every source, *holding the spectral shapes and backgrounds fixed*, is a linear weighted least-squares problem:
+
+$$\min_a \; \Big\| \frac{d - t_\text{exp}(G a + b)}{\sigma} \Big\|^2$$
+
+where $G$ is the (sparse, per-source postage-stamp) design operator and $y = (d - t_\text{exp}b)/\sigma$. Writing the residual as $f(a) = y - Ma$ (affine in $a$), `solve_log_amplitudes` forms the normal equations
+
+$$(M^\top M)\, a = M^\top y .$$
+
+**`M` is built directly from the unit-amplitude postage stamps**, not by autodiff: `gen_module.source_stamps` is called once per band group (vectorized over exposures with `jax.vmap`) to produce each source's stamp plus its pixel indices, after which every CG iteration is a cheap scatter/gather (`_amplitude_forward` / `_amplitude_adjoint`) rather than a forward-model evaluation. Note the adjoint indexes the *spatial* axes, so the scatter/gather must be `vmap`-ed over the exposure axis (indexing a stacked `(E, H, W)` array directly would silently index the wrong axes).
+
+**Everything above is compiled into a single `jax.jit`** by `_make_amplitude_solver`: the stamps, the diagonal, the right-hand side, and a hand-rolled `jax.lax.while_loop` conjugate gradient (`_cg_solve`) — no Python-level iteration and no `lineax` re-dispatch. This matters enormously. Profiling at 128 sources × 32 exposures showed the **arithmetic was only ~0.1 s while the wall clock was ~2.2 s**: ~91% of the cost was JAX *tracing* the stamp program again on every call (the solver was plain Python, so each invocation rebuilt the same jaxpr from scratch). With the solver built once and reused — which `infer_parameters` does, and which is why `solve_log_amplitudes` documents that repeated callers should use `_make_amplitude_solver` directly — the solve takes **0.116 s** (18.8× faster), with identical results.
+
+- **All sources are solved jointly** across the whole exposure stack, so overlaps/blending and the multi-exposure constraint (one amplitude per source) are handled exactly.
+- **Jacobi scaling (always on, not optional).** The normal matrix is extremely ill-scaled: because $M$ is expressed in *absolute* amplitude units, $\mathrm{diag}(M^\top M)$ spans ~65 orders of magnitude in the mock. The solver applies a symmetric change of variables $a = Dc$ with $D = \mathrm{diag}(M^\top M)^{-1/2}$ (so the scaled normal matrix has unit diagonal). This is a *correctness* requirement, not a speed option — in the unscaled variables the normal matrix spans ~12 decades and float32 CG cannot converge — so there is deliberately no flag to disable it.
+- **Information threshold.** A source whose postage stamp lies (almost) entirely beyond the detector edge has a negligible design diagonal but is still technically "observed". Solving for it is unconstrained and produces absurd values, so sources with $\mathrm{diag} < 10^{-6}\max(\mathrm{diag})$ are excluded and keep their current amplitude. (Before this, ~10% of sources were driven to $a \approx 0$, which also *froze* them: the gradient $\partial \mathcal{L}/\partial \log A = a\,\partial\mathcal{L}/\partial a$ vanishes as $a\to0$, so SGD could never revive them.)
+- **Regularization / failure safety.** A tiny ridge (`damping`) is applied in the scaled space, guaranteeing the operator is strictly positive definite (sources in no exposure get an O(1) shift instead of a zero row, which previously made the system singular and produced `NaN` from CG). Failure is handled *branchlessly* inside the jit — if the solution is non-finite the previous amplitudes are kept — so a bad linear solve can never corrupt the fit and there is no Python-level `if` to trigger re-tracing.
+- **Inner iteration cap.** `cg_max_steps` defaults to 50; the preconditioned system typically converges in 1–5 iterations.
+
+### 5.6 SGD interlace
+
+`infer_parameters` interleaves the two updates by default: every `amp_solve_every` SGD steps (default 10) it replaces the log-amplitude column with the `solve_log_amplitudes` result (shapes and backgrounds held fixed), plus one final solve after the loop. The jitted solver is **built once before the loop** (`_make_amplitude_solver`), so the interlace never re-traces or recompiles it. SGD's optimiser state is untouched by this external update. `amp_verbose=True` prints the loss before/after each solve, and the interlace is automatically disabled (with a warning) if the generators do not expose `source_stamps`. This is remarkably effective — in the full-scale mock the first interleaved solve drops $\chi^2/\text{pixel}$ from $1.9\times10^5$ to $\sim\!42$ in a single call, where pure SGD needs many steps to do the same.
+
+### 5.7 Diagnostic: `compute_lm_loss`
 
 Evaluates the **exact same** residual function that LM uses internally (`_make_residual_fn`), returning `sum(r²)/n_pixels`. This can be checked against `compute_loss` (which uses `_per_exposure_sumsq`) to verify consistency. Both should agree to machine precision.
 
@@ -250,7 +280,7 @@ Key globals at the top of the file:
 
 ### 6.2 Pipeline steps
 
-1. **Estimate amplitude limits** (`_estimate_amplitude_limits`): computes the amplitude range such that a T=3000K blackbody produces ~100 to ~5×10⁶ detected photons per exposure over Band 3. Uses `trapezoid` integration over a dense 500-point wavelength grid.
+1. **Amplitude range** (`_report_photon_counts`): amplitudes are specified *directly* on the physical $f_\lambda(\lambda_0)$ scale via the `AMPLITUDE_MIN`/`AMPLITUDE_MAX` constants — there is no photon-count *targeting*. The implied detected photon counts are only *reported*, by integrating the blackbody shape over each band (with the Gaussian filter) times `EXPOSURE_TIME`.
 
 2. **Generate catalog** (`_generate_catalog`): sources uniformly distributed on the sphere within a spherical cap, with log-uniform temperatures in [3000, 8000] K and power-law amplitudes P(A) ∝ A^{-1.5}.
 
@@ -325,6 +355,28 @@ When using quantile-based importance sampling, the integrand is `(λ/hc)·f_λ·
 
 Full-scale computations (hundreds of sources × many exposures) can exhaust memory on CPU-only machines. Always test correctness at tiny scale (~10 sources, 2 exposures, 32×32 detector) before scaling up.
 
+### 7.13 Amplitude units and the need for preconditioning
+
+The spectrum models return a *shape* normalised to 1 at $\lambda_0$, and the generator multiplies in $\exp(\log A)$ itself. Consequently the design operator of the amplitude solve (§5.5) is expressed in **absolute** amplitude units, and since catalog amplitudes can span many decades, the unpreconditioned normal matrix $M^\top M$ overflows float32 (observed: CG returning a zero vector after one step). The Jacobi scaling transform in `solve_log_amplitudes` is therefore a *correctness* requirement, not just a speed optimisation: keep `precondition=True` (the default) whenever `source_stamps` is available. Note also that the shape is pinned to exactly 1 at $\lambda_0$, so $d(\text{shape})/dT = 0$ there — any gradient test must evaluate at a wavelength away from $\lambda_0$.
+
+### 7.14 Three failure modes of the amplitude solve, and their symptoms
+
+1. **Singular system → `NaN` from CG.** Sources absent from every exposure have a zero design diagonal, so an unscaled/regularized operator is singular and `lineax.CG` raises "linear solver returned non-finite output". Fixed by a tiny ridge in the scaled space plus an O(1) shift on the excluded rows, and by running the solve with `throw=False` and checking finiteness.
+2. **Negligible-but-nonzero stamps → absurd amplitudes.** A source sitting just outside the detector edge is "observed" (its index appears in `src_idx`) yet contributes essentially nothing, giving $\mathrm{diag}\sim10^{-32}$. Dividing by its own tiny diagonal yields a meaningless amplitude. Fixed by the relative information threshold $\mathrm{diag} > 10^{-6}\max(\mathrm{diag})$.
+3. **Frozen amplitudes after clamping.** Clamping a negative least-squares amplitude to a tiny positive value looks harmless but is fatal: $\partial\mathcal{L}/\partial\log A = a\,\partial\mathcal{L}/\partial a \to 0$ as $a\to0$, so SGD can never recover that source. Leave ill-constrained sources at their current value instead of clamping them to ~0.
+
+### 7.15 Band-grouped helpers receive already-group-indexed arrays
+
+`_prepare_band_group` stores `group_idx` as *global* exposure indices, and every group-level helper (e.g. `_prepare_band_group`'s consumers) is passed arrays already indexed by it. Re-indexing inside a helper (`log_backgrounds[idx][idx]`) is therefore wrong — and worse, JAX silently *clamps* out-of-range gather indices instead of erroring, so it corrupts results without raising. The bug was masked in testing because the mock generates one constant background per band: within a band group every entry is identical, so the mis-indexing was a no-op. The regression test therefore uses **two exposures sharing a band with different per-exposure backgrounds**.
+
+### 7.16 Tracing overhead, not arithmetic, dominates naive JAX helper loops
+
+The amplitude solve originally ran as plain Python. Profiling showed the *arithmetic* took ~0.1 s while the wall clock was ~2.2 s: **~91% was JAX tracing** — every call rebuilt the same jaxpr for the `vmap(over exposures) ∘ lax.map(over sources)` stamp program, and `lineax`'s jitted `linear_solve` re-compiled too because the `matvec` closure captured fresh arrays. The fix is structural, not algorithmic: compile the whole computation once (`_make_amplitude_solver`) and pass the changing values in as *arguments*, not closures. Concretely:
+
+- Rebuilding a jitted callable per invocation (as a naive `solve_log_amplitudes` wrapper does) still costs ~1.2 s per call, versus ~0.12 s when the compiled solver is reused. Keep the factory call **outside** any optimisation loop.
+- The same pattern applies to any helper that is called repeatedly; prefer building the compiled callable once and caching it.
+- Note the contrast with §7.4: jitting the whole *LM residual* is still a bad idea (minutes of compile for a huge graph). The amplitude solve compiles in ~1.3 s because its graph is small — the rule is "measure the compile time", not "never jit".
+
 ---
 
 ## 8. File Map
@@ -332,14 +384,14 @@ Full-scale computations (hundreds of sources × many exposures) can exhaust memo
 | File | Purpose |
 |---|---|
 | `spherex/constants.py` | Physical constants in codebase-native units (kJ, µm, arcsec) |
-| `spherex/spectrum.py` | `BlackbodySpectrum` — source spectrum template |
+| `spherex/spectrum.py` | `BlackbodySpectrum` — shape-only source spectrum template (normalised to 1 at the global `LAMBDA_0`), plus the `[log_amplitude, shape…]` layout helpers |
 | `spherex/psf.py` | `GaussianPSF` — wavelength-dependent Gaussian PSF |
 | `spherex/transmission.py` | `GaussianFilterTransmission` — LVF transmission with quantile interface |
-| `spherex/image.py` | `_one_subpixel_rate` (quantile integration), `ImageGenerator` (scan-based) |
-| `spherex/image3.py` | `ImageGenerator3` (chunked-batch, uses `_one_subpixel_rate` from `image.py`) |
+| `spherex/image.py` | `_one_subpixel_rate` (quantile integration; splits amplitude out of `source_params`), `ImageGenerator` (scan-based) |
+| `spherex/image3.py` | `ImageGenerator3` (chunked-batch, uses `_one_subpixel_rate` from `image.py`), plus `source_stamps` for the amplitude-solve preconditioner |
 | `spherex/config.py` | `SpherexImageGenerator`, `SpherexImageGenerator3` — pre-configured per-band generators, `_build_band`, band table |
 | `spherex/__init__.py` | Public API exports |
-| `scripts/inference.py` | `infer_parameters` (SGD), `infer_parameters_lm` (LM), `compute_loss`, `compute_lm_loss`, `plot_loss_history`, `plot_comparison`, residual functions, custom LM solver |
+| `scripts/inference.py` | `infer_parameters` (SGD, with amplitude interlace), `infer_parameters_lm` (LM), `solve_log_amplitudes` (direct amplitude least-squares), `compute_loss`, `compute_lm_loss`, `plot_loss_history`, `plot_comparison`, residual functions, custom LM solver |
 | `scripts/mock_spherex_images.py` | End-to-end mock: catalog, exposures, image generation, hybrid SGD+LM inference, diagnostics, benchmarks |
 | `tests/test_image3.py` | Numerical tests verifying ImageGenerator3 ≡ ImageGenerator |
 | `pyproject.toml` | Dependencies: `jax`, `equinox`, `optimistix`, `lineax`, `numpy` |

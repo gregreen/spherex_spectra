@@ -10,6 +10,7 @@ import jax
 import jax.numpy as jnp
 
 from .constants import HC_JAX
+from .spectrum import split_source_params
 
 
 # ---------------------------------------------------------------------------
@@ -62,7 +63,7 @@ def _subpixel_centers(
 def _one_subpixel_rate(
     omega_p: jnp.ndarray,          # (2,)  – sub-pixel centre  [arcsec]
     omega_s: jnp.ndarray,          # (2,)  – source position   [arcsec]
-    spectrum_params: jnp.ndarray,  # (P,)  – source parameters
+    source_params: jnp.ndarray,    # (1 + P,) – [log_amplitude, shape params]
     spectrum_model: eqx.Module,
     psf: eqx.Module,
     transmission: eqx.Module,
@@ -74,6 +75,14 @@ def _one_subpixel_rate(
     factor), i.e. ::
 
         ∫ dλ  (λ / hc) * f_λ(λ) * PSF(Ω_p) * T(λ | Ω_p)
+
+    ``source_params`` holds the per-source parameters with the
+    **log-amplitude in the first column** (see
+    ``spherex.spectrum.LOG_AMPLITUDE_INDEX``).  The spectrum model receives
+    only ``source_params[..., 1:]`` and therefore describes the spectral
+    *shape* only; the generator multiplies the amplitude back in here::
+
+        f_λ(λ) = exp(log_amplitude) * spectrum_model(λ, shape_params)
 
     The integral is estimated via quantile / inverse-CDF importance
     sampling against the transmission profile itself, rather than fixed
@@ -97,7 +106,10 @@ def _one_subpixel_rate(
     lambdas = transmission.quantile(q, omega_p)               # (N_λ,)
     norm = transmission.total_transmission(omega_p)           # scalar
 
-    f_lam = spectrum_model(lambdas, spectrum_params)          # (N_λ,)
+    log_amplitude, shape_params = split_source_params(source_params)
+    shape = spectrum_model(lambdas, shape_params)             # (N_λ,)
+    f_lam = jnp.exp(log_amplitude) * shape                    # (N_λ,)
+
     psf_val = psf(omega_p, omega_s, lambdas)                  # (N_λ,)
 
     integrand = (lambdas / HC_JAX) * f_lam * psf_val          # (N_λ,)
@@ -111,7 +123,7 @@ def _one_subpixel_rate(
 def photon_rate_per_pixel(
     omega_p_centers: jnp.ndarray,     # (K², 2)
     omega_s: jnp.ndarray,             # (2,)
-    spectrum_params: jnp.ndarray,     # (P,)
+    source_params: jnp.ndarray,       # (1 + P,)  – [log_amplitude, shape...]
     spectrum_model: eqx.Module,
     psf: eqx.Module,
     transmission: eqx.Module,
@@ -133,10 +145,11 @@ def photon_rate_per_pixel(
         Sub-pixel centre positions in arcsec (from ``_subpixel_centers``).
     omega_s : shape ``(2,)``
         Source position in arcsec.
-    spectrum_params : shape ``(n_params,)``
-        Parameters for the spectrum model (e.g. [T, amplitude]).
+    source_params : shape ``(1 + P,)``
+        Per-source parameters with the log-amplitude in the first column and
+        the spectrum-shape parameters (e.g. log-temperature) in the rest.
     spectrum_model : equinox.Module
-        Spectrum template (e.g. ``BlackbodySpectrum``).
+        Spectrum-shape template (e.g. ``BlackbodySpectrum``).
     psf : equinox.Module
         PSF model.
     transmission : equinox.Module
@@ -162,7 +175,7 @@ def photon_rate_per_pixel(
     )(
         omega_p_centers,          # (K², 2) -> vmap over first axis
         omega_s,
-        spectrum_params,
+        source_params,
         spectrum_model,
         psf,
         transmission,
@@ -202,6 +215,10 @@ class ImageGenerator(eqx.Module):
     __call__(source_positions, source_params, image_width, image_height,
              pixel_scale, postage_stamp_half_size, n_wavelength_samples,
              oversampling=1) -> image (H, W) in s⁻¹
+
+    ``source_params`` has shape ``(S, 1 + P)``: the log-amplitude in the first
+    column and the spectrum-shape parameters (passed to ``spectrum_model``) in
+    the rest.
     """
 
     psf: eqx.Module
@@ -212,7 +229,7 @@ class ImageGenerator(eqx.Module):
     def __call__(
         self,
         source_positions: jnp.ndarray,      # (S, 2)  [arcsec]
-        source_params: jnp.ndarray,         # (S, P)
+        source_params: jnp.ndarray,         # (S, 1 + P)  [log_amplitude, shape...]
         image_width: int,
         image_height: int,
         pixel_scale: float,
