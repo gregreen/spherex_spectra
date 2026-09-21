@@ -4,6 +4,7 @@ from .constants import (H, C, HC, KB, H_JAX, C_JAX, HC_JAX, KB_JAX,
                          TEMPERATURE_UNIT, WAVELENGTH_UNIT)
 from .spectrum import (
     BlackbodySpectrum,
+    NeuralNetSpectrum,
     LAMBDA_0,
     LOG_AMPLITUDE_INDEX,
     split_source_params,
@@ -21,6 +22,7 @@ __all__ = [
     "H_JAX", "C_JAX", "HC_JAX", "KB_JAX",
     "TEMPERATURE_UNIT", "WAVELENGTH_UNIT",
     "BlackbodySpectrum",
+    "NeuralNetSpectrum",
     "LAMBDA_0",
     "LOG_AMPLITUDE_INDEX",
     "split_source_params",

@@ -128,13 +128,28 @@ All models are `equinox.Module` subclasses in `spherex/`. They store hyperparame
 - **Layout helpers**: `LOG_AMPLITUDE_INDEX`, `split_source_params`, `join_source_params` define the `[log_amplitude, shape…]` convention in one place
 - **Implementation detail**: uses `inv_T_scale = HC/(λ·KB)` to avoid float32 underflow in the Planck gradient
 
-### 3.2 `GaussianPSF` (`spherex/psf.py`)
+### 3.2 `NeuralNetSpectrum` (`spherex/spectrum.py`)
+
+A flexible alternative to the blackbody. A small MLP maps `(wavelength, shape_params)` to a log-flux and the shape is the exponential of the difference between that log-flux and its value at `LAMBDA_0`:
+
+$$\hat{B}_\lambda(\lambda) = \exp\big(\mathrm{NN}(\lambda, \theta) - \mathrm{NN}(\lambda_0, \theta)\big)$$
+
+which is *exactly* 1 at $\lambda_0$ for **any** $\theta$. Keeping the blackbody's normalisation convention is what makes the amplitude (first column of `source_params`) remain $f_\lambda(\lambda_0)$, and it is why **the entire amplitude pipeline works unchanged**: the least-squares solve only requires the model to be linear in amplitude and the shape to be independent of it, both of which hold (verified numerically — the solve recovers amplitudes to ~2×10⁻² in log on a synthetic problem, driving $\chi^2/\text{pixel}$ from ~2×10⁴ to ~1.1).
+
+- **Attributes**: `layers` (list of `eqx.nn.Linear`), `n_params` (number of *shape* parameters), `n_hidden_layers`, `hidden_size`
+- **`__init__(n_params, n_hidden_layers, hidden_size, *, key)`**: `key` is **required** (`eqx.nn.Linear` needs a PRNG key); one key per layer is derived with `jax.random.split`. All fields are declared as annotations, which is mandatory for `equinox.Module` (pytree) behaviour.
+- **Batching contract** (identical to `BlackbodySpectrum`): `__call__(wavelength (N_λ,), shape_params (P,)) -> (N_λ,)`, i.e. **one source, many wavelengths**. The image generators already supply the other axes — `jax.vmap` over sub-pixels and `lax.scan`/`lax.map` over sources — and call `spectrum_model(lambdas, shape_params)` once per source per sub-pixel, so the model must not try to batch them itself.
+- **Internals**: the MLP is evaluated one wavelength at a time and vectorised with `jax.vmap`. An MLP layer expects the feature axis last, so `concatenate([λ, θ])` is only well defined for a *scalar* λ (a wavelength *vector* would be read as extra features). To batch over sources as well, compose a second vmap at the call site: `jax.vmap(model, in_axes=(None, 0))(wavelengths, shape_params_batch)`.
+- **Cost caution**: the shape is evaluated at every wavelength sample of every sub-pixel of every source, and an MLP costs orders of magnitude more per point than the closed-form blackbody — this slows the forward model *and* each interleaved amplitude solve (which rebuilds the postage stamps). Keep `hidden_size` modest. Each call also evaluates the network once at `LAMBDA_0` to normalise, so with `n_wavelength_samples = 1` the MLP runs twice per point.
+- The raw network output is unbounded, so `exp` of a large log-ratio can overflow; clip the exponent if the shape parameters are free to wander far.
+
+### 3.3 `GaussianPSF` (`spherex/psf.py`)
 
 - **Attributes**: `fwhm_ref` (arcsec), `wavelength_ref` (µm)
 - **`__call__(omega_p, omega_s, wavelength)`**: returns PSF value in arcsec⁻²
 - **Normalization**: integrates to 1 over ℝ² in arcsec² (2-D Gaussian normalization)
 
-### 3.3 `GaussianFilterTransmission` (`spherex/transmission.py`)
+### 3.4 `GaussianFilterTransmission` (`spherex/transmission.py`)
 
 - **Attributes**: `lambda_intercept` (µm), `lambda_slope` (µm/arcsec), `width` (µm)
 - **`__call__(wavelength, omega_p)`**: returns transmission ∈ [0,1]
@@ -144,14 +159,14 @@ All models are `equinox.Module` subclasses in `spherex/`. They store hyperparame
 
 **Interface contract**: any replacement transmission model must implement `quantile` and `total_transmission`. These are used by the wavelength integrator and NOT optional.
 
-### 3.4 Image generators (`spherex/image.py`, `spherex/image3.py`)
+### 3.5 Image generators (`spherex/image.py`, `spherex/image3.py`)
 
 - `ImageGenerator`: iterates over sources via `jax.lax.scan`, computing one postage stamp at a time
 - `ImageGenerator3`: uses `jax.lax.map(..., batch_size=...)` for chunked parallel processing, then a single vectorized scatter-add — faster but functionally identical
  `source_params` has shape `(S, 1 + P)`: column 0 is the log-amplitude, and the remaining columns are passed to the spectrum model as its shape parameters. `ImageGenerator3` additionally exposes `source_stamps(...)`, returning the per-source postage stamps (before scatter-add) so callers can build per-source quadratic forms such as the amplitude-solve preconditioner diagonal.
 Both accept the same `__call__` signature: `(source_positions, source_params, image_width, image_height, pixel_scale, postage_stamp_half_size, n_wavelength_samples, oversampling)`.
 
-### 3.5 Pre-configured generators (`spherex/config.py`)
+### 3.6 Pre-configured generators (`spherex/config.py`)
 
 - `SpherexImageGenerator` and `SpherexImageGenerator3` pre-configure an `ImageGenerator`/`ImageGenerator3` for a specific SPHEREx band (1–6)
 - Constructor accepts `band`, `psf_scale`, `lambda_slope_scale`, and detector geometry
@@ -384,6 +399,10 @@ The amplitude solve originally ran as plain Python. Profiling showed the *arithm
 - The same pattern applies to any helper that is called repeatedly; prefer building the compiled callable once and caching it.
 - Note the contrast with §7.4: jitting the whole *LM residual* is still a bad idea (minutes of compile for a huge graph). The amplitude solve compiles in ~1.3 s because its graph is small — the rule is "measure the compile time", not "never jit".
 
+### 7.17 Spectrum models must not batch themselves
+
+The spectrum-model interface is *one source × many wavelengths*: `spherex.image._one_subpixel_rate` calls `spectrum_model(lambdas, shape_params)` per source and per sub-pixel and expects `(N_λ,)` back, having already applied `jax.vmap` over sub-pixels and `lax.scan`/`lax.map` over sources. A model whose `__call__` only accepts a *scalar* wavelength therefore cannot be dropped in — every call site would need its own `vmap` — and a model that tries to concatenate a wavelength *vector* with the parameters gets extra *features* rather than extra examples (an MLP layer wants the feature axis last). The pattern that works: a scalar core plus an internal `jax.vmap` over wavelengths, with source batching left to the caller. `BlackbodySpectrum` and `NeuralNetSpectrum` both follow it, which is what makes the generators model-agnostic.
+
 ---
 
 ## 8. File Map
@@ -391,7 +410,7 @@ The amplitude solve originally ran as plain Python. Profiling showed the *arithm
 | File | Purpose |
 |---|---|
 | `spherex/constants.py` | Physical constants in codebase-native units (kJ, µm, arcsec) |
-| `spherex/spectrum.py` | `BlackbodySpectrum` — shape-only source spectrum template (normalised to 1 at the global `LAMBDA_0`), plus the `[log_amplitude, shape…]` layout helpers |
+| `spherex/spectrum.py` | `BlackbodySpectrum` (analytic) and `NeuralNetSpectrum` (MLP) — shape-only source spectrum templates, both normalised to 1 at the global `LAMBDA_0`, plus the `[log_amplitude, shape…]` layout helpers |
 | `spherex/psf.py` | `GaussianPSF` — wavelength-dependent Gaussian PSF |
 | `spherex/transmission.py` | `GaussianFilterTransmission` — LVF transmission with quantile interface |
 | `spherex/image.py` | `_one_subpixel_rate` (quantile integration; splits amplitude out of `source_params`), `ImageGenerator` (scan-based) |

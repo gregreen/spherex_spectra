@@ -7,6 +7,7 @@ import pytest
 
 from spherex.spectrum import (
     BlackbodySpectrum,
+    NeuralNetSpectrum,
     LAMBDA_0,
     LOG_AMPLITUDE_INDEX,
     split_source_params,
@@ -142,3 +143,77 @@ def test_split_join_source_params():
     assert jnp.allclose(log_amp[:, 0], jnp.array([1.0, 4.0]))
     assert jnp.allclose(shape, jnp.array([[2.0, 3.0], [5.0, 6.0]]))
     assert jnp.allclose(join_source_params(log_amp, shape), source_params)
+
+
+# ---------------------------------------------------------------------------
+# NeuralNetSpectrum
+# ---------------------------------------------------------------------------
+#
+# The model must satisfy the same interface as BlackbodySpectrum: one source's
+# shape params ``(n_params,)`` and many wavelengths ``(N_lambda,)`` in, a
+# ``(N_lambda,)`` shape out, normalised to 1 at LAMBDA_0.  Batching over
+# sources is the caller's job (the image generators already map over sources).
+
+
+@pytest.fixture
+def nn():
+    return NeuralNetSpectrum(
+        n_params=2, n_hidden_layers=2, hidden_size=8,
+        key=jax.random.PRNGKey(0),
+    )
+
+
+def test_neural_net_output_shape(nn):
+    """One source's params + many wavelengths -> (N_lambda,)."""
+    lam = jnp.array([0.5, 1.0, 2.0])
+    params = jnp.zeros(2)
+    result = nn(lam, params)
+    assert result.shape == (3,)
+
+
+def test_neural_net_single_wavelength(nn):
+    """A scalar wavelength is promoted to a length-1 vector."""
+    result = nn(jnp.array(1.5), jnp.zeros(2))
+    assert result.shape == (1,)
+
+
+def test_neural_net_normalised_at_lambda_0(nn):
+    """The shape must be exactly 1 at the reference wavelength."""
+    for params in (jnp.zeros(2), jnp.array([1.0, -2.0])):
+        assert jnp.allclose(
+            nn(jnp.array([LAMBDA_0]), params), 1.0, rtol=1e-5
+        )
+
+
+def test_neural_net_positivity(nn):
+    """The shape is an exponential, so it must be strictly positive."""
+    lam = jnp.linspace(0.4, 5.0, 50)
+    assert jnp.all(nn(lam, jnp.array([0.3, -0.7])) > 0)
+
+
+def test_neural_net_gradient(nn):
+    """Gradients w.r.t. shape params should be finite and non-zero."""
+    lam = jnp.array([0.5, 1.0, 2.0])
+    params = jnp.array([0.1, -0.2])
+
+    grad = jax.grad(lambda p: jnp.sum(nn(lam, p)))(params)
+    assert grad.shape == (2,)
+    assert jnp.all(jnp.isfinite(grad))
+    assert jnp.any(grad != 0.0)
+
+
+def test_neural_net_consistent_under_vmap(nn):
+    """Vmapping over sources must match looping over sources."""
+    lam = jnp.array([0.5, 1.0, 2.0])
+    thetas = jnp.array([[0.0, 0.0], [0.5, -0.5], [1.0, 0.25]])
+
+    batched = jax.vmap(nn, in_axes=(None, 0))(lam, thetas)
+    assert batched.shape == (3, 3)
+    for i in range(thetas.shape[0]):
+        assert jnp.allclose(batched[i], nn(lam, thetas[i]))
+
+
+def test_neural_net_n_params(nn):
+    """``n_params`` counts shape parameters (amplitude lives outside)."""
+    assert nn.n_params == 2
+

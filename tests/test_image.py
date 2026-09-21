@@ -7,6 +7,7 @@ import pytest
 
 from spherex import (
     BlackbodySpectrum,
+    NeuralNetSpectrum,
     GaussianPSF,
     GaussianFilterTransmission,
     ImageGenerator,
@@ -257,6 +258,74 @@ def test_image_linear_in_amplitude(generator):
                      postage_stamp_half_size=8,
                      n_wavelength_samples=21, oversampling=1)
     log_doubled = log_base.at[:, 0].add(jnp.log(2.0))  # double amplitude
+    img2 = generator(pos, log_doubled, 20, 20, 0.5,
+                     postage_stamp_half_size=8,
+                     n_wavelength_samples=21, oversampling=1)
+    assert jnp.allclose(img2, 2.0 * img1, rtol=1e-5)
+
+
+# ---------------------------------------------------------------------------
+# Spectrum-model agnosticism: the generator must accept any model that
+# implements the (wavelengths (N_λ,), shape_params (P,)) -> (N_λ,) contract.
+# ---------------------------------------------------------------------------
+
+def test_image_generator_with_neural_net_spectrum(psf, transmission):
+    """A NeuralNetSpectrum model is usable end-to-end by the generator."""
+    model = NeuralNetSpectrum(
+        n_params=2, n_hidden_layers=2, hidden_size=8,
+        key=jax.random.PRNGKey(0),
+    )
+    generator = ImageGenerator(
+        psf=psf, transmission=transmission,
+        spectrum_model=model, aperture=1.0,
+    )
+
+    pos = jnp.array([[5.0, 5.0], [10.0, 10.0]])
+    # source_params = [log_amplitude, theta_0, theta_1]
+    params = jnp.array([[jnp.log(1e-13), 0.1, -0.2],
+                        [jnp.log(2e-13), -0.3, 0.4]])
+
+    img = generator(pos, params, 20, 20, 0.5,
+                    postage_stamp_half_size=8,
+                    n_wavelength_samples=21, oversampling=1)
+    assert img.shape == (20, 20)
+    assert jnp.all(img >= 0)
+    assert jnp.sum(img) > 0
+
+    # Gradients must flow into the spectrum-model shape params.
+    def total_flux(shape_params):
+        p = params.at[:, 1:].set(shape_params)
+        return jnp.sum(generator(pos, p, 20, 20, 0.5,
+                                 postage_stamp_half_size=8,
+                                 n_wavelength_samples=21,
+                                 oversampling=1))
+
+    grad = jax.grad(total_flux)(params[:, 1:])
+    assert grad.shape == params[:, 1:].shape
+    assert jnp.all(jnp.isfinite(grad))
+    assert jnp.any(grad != 0.0)
+
+
+def test_image_linear_in_amplitude_neural_net_spectrum(psf, transmission):
+    """Amplitude linearity (used by the least-squares solve) holds for the NN
+    model too, since the shape never depends on the amplitude."""
+    model = NeuralNetSpectrum(
+        n_params=2, n_hidden_layers=2, hidden_size=8,
+        key=jax.random.PRNGKey(1),
+    )
+    generator = ImageGenerator(
+        psf=psf, transmission=transmission,
+        spectrum_model=model, aperture=1.0,
+    )
+
+    pos = jnp.array([[5.0, 5.0], [10.0, 10.0]])
+    log_base = jnp.array([[jnp.log(1e-13), 0.1, -0.2],
+                          [jnp.log(2e-13), -0.3, 0.4]])
+
+    img1 = generator(pos, log_base, 20, 20, 0.5,
+                     postage_stamp_half_size=8,
+                     n_wavelength_samples=21, oversampling=1)
+    log_doubled = log_base.at[:, 0].add(jnp.log(2.0))
     img2 = generator(pos, log_doubled, 20, 20, 0.5,
                      postage_stamp_half_size=8,
                      n_wavelength_samples=21, oversampling=1)
