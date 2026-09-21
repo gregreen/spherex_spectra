@@ -832,14 +832,14 @@ def infer_parameters(
     exposures,
     init_log_params,
     n_steps=500,
-    learning_rate=1e-3,
+    learning_rate=1e-2,
     warmup_steps=50,
     momentum=0.5,
     n_lambda=5,
     oversampling=2,
     batched=False,
     precondition_rms=True,
-    amp_solve_every=10,
+    amp_solve_every=16,
     amp_cg_max_steps=50,
     amp_verbose=False,
 ):
@@ -897,7 +897,7 @@ def infer_parameters(
         warmup-cosine learning-rate schedule).
     amp_solve_every : int or None
         Interlace the direct amplitude least-squares solve every this many
-        SGD steps (default 10), plus one final solve after the loop.
+        SGD steps (default 16), plus one final solve after the loop.
         ``None`` (or 0) disables the interlace.
     amp_cg_max_steps : int or None
         Iteration cap for the amplitude solve's inner CG.
@@ -1338,7 +1338,7 @@ def plot_comparison(true_params, recovered_params, bright_mask, fname):
         (ax2, true_T, rec_T, "log(T / kK)"),
     ]:
         ax.scatter(true_vals[~bright_mask], rec_vals[~bright_mask],
-                   s=1, color="gray", alpha=0.3, rasterized=True)
+                   s=1, color="gray", alpha=0.3, rasterized=False)
         ax.scatter(true_vals[bright_mask], rec_vals[bright_mask],
                    s=4, color="red", alpha=0.8, label="Bright")
         vmin = min(true_vals.min(), rec_vals.min())

@@ -207,8 +207,9 @@ Inference is in `scripts/inference.py`. Two optimizers are available (SGD and Le
 ### 5.2 SGD (`infer_parameters`)
 
 - Optimizer: `clip(1.0) → scale_by_rms → sgd(momentum, warmup_cosine_decay_schedule)`
-- Learning rate: linear warmup from 0 to peak, then cosine decay to 0
+- Learning rate: linear warmup from 0 to peak, then cosine decay to 0 (default peak `learning_rate=1e-2`, `warmup_steps=50`, `momentum=0.5`)
 - The entire training step (loss + grad + update) is compiled into a single `jax.jit` via `_make_train_step`
+- The amplitude least-squares solve is interleaved every `amp_solve_every` SGD steps (default **16**; cf. §5.6)
 - Returns `(log_params, log_backgrounds, losses, lrs)`
 
 ### 5.3 Levenberg-Marquardt (`infer_parameters_lm`)
@@ -252,7 +253,7 @@ $$(M^\top M)\, a = M^\top y .$$
 
 ### 5.6 SGD interlace
 
-`infer_parameters` interleaves the two updates by default: every `amp_solve_every` SGD steps (default 10) it replaces the log-amplitude column with the `solve_log_amplitudes` result (shapes and backgrounds held fixed), plus one final solve after the loop. The jitted solver is **built once before the loop** (`_make_amplitude_solver`), so the interlace never re-traces or recompiles it. SGD's optimiser state is untouched by this external update. `amp_verbose=True` prints the loss before/after each solve, and the interlace is automatically disabled (with a warning) if the generators do not expose `source_stamps`. This is remarkably effective — in the full-scale mock the first interleaved solve drops $\chi^2/\text{pixel}$ from $1.9\times10^5$ to $\sim\!42$ in a single call, where pure SGD needs many steps to do the same.
+`infer_parameters` interleaves the two updates by default: every `amp_solve_every` SGD steps (default 16) it replaces the log-amplitude column with the `solve_log_amplitudes` result (shapes and backgrounds held fixed), plus one final solve after the loop. The jitted solver is **built once before the loop** (`_make_amplitude_solver`), so the interlace never re-traces or recompiles it. SGD's optimiser state is untouched by this external update. `amp_verbose=True` prints the loss before/after each solve, and the interlace is automatically disabled (with a warning) if the generators do not expose `source_stamps`. This is remarkably effective — in the full-scale mock the first interleaved solve drops $\chi^2/\text{pixel}$ from $1.9\times10^5$ to $\sim\!42$ in a single call, where pure SGD needs many steps to do the same.
 
 ### 5.7 Diagnostic: `compute_lm_loss`
 
@@ -298,6 +299,12 @@ Key globals at the top of the file:
 6. **Inference** (see §5)
 
 7. **Diagnostic plots**: loss history (asinh y-scale), true-vs-recovered scatter, predicted/residual images
+
+   The true-vs-recovered scatter (`plots/comparison.svg`) highlights "bright" sources, defined as those **detected at S/N > `SNR_THRESHOLD` (5) in at least `MIN_BANDS` (3) distinct SPHEREx bands** — bands, not exposures, so that a source repeatedly observed in one band (which constrains only one point of its spectrum) is not promoted. The per-(source, exposure) S/N is the expected matched-filter significance of the source's own noiseless model counts,
+
+   $$\text{S/N} = \sqrt{\sum_i \frac{(m_i\, t_\text{exp})^2}{\sigma_i^2}}$$
+
+   where $m_i$ is the source-only model rate in pixel $i$ (from its unit-amplitude postage stamp, so PSF and amplitude included) and $\sigma_i$ the per-pixel noise. Using the model rather than the noisy data keeps the label free of noise bias, and taking the expectation of the optimal flux estimator makes this simply "how many sigma the source's flux stands above the noise" (zero-flux pixels drop out automatically). All of it uses the **true** parameters: deriving the label from recovered parameters would be circular, since a source whose amplitude estimate diverges upward would then be labelled "bright" precisely because of the convergence failure being diagnosed. See `_source_snr` / `_compute_bright_mask`.
 
 ### 6.3 Wavelength gradient scaling with downsampling
 

@@ -78,6 +78,12 @@ AMPLITUDE_MAX = 5.0e-11
 PNG_PERCENTILE_LO = 0.2
 PNG_PERCENTILE_HI = 99.8
 
+# "Bright" source selection for the diagnostic comparison plot: a source is
+# labelled bright if its detection S/N exceeds SNR_THRESHOLD in at least
+# MIN_BANDS distinct SPHEREx bands (not merely exposures).
+SNR_THRESHOLD = 5.0
+MIN_BANDS = 3
+
 # Output directory
 PLOTS_DIR = "plots"
 
@@ -528,6 +534,83 @@ def _plot_sky_locations(skycoords, exposures, fname):
     print(f"Saved {fname}")
 
 
+def _source_snr(gen, positions, params, sigma_img, half_stamp,
+                n_lambda=N_LAMBDA, oversampling=2):
+    """Estimated detection S/N of each source in a single exposure.
+
+    Uses the expected matched-filter significance of the source's own
+    (noiseless) model counts against the per-pixel noise::
+
+        S/N = sqrt( sum_i (m_i * t_exp)^2 / sigma_i^2 )
+
+    where ``m_i`` is the source-only model rate in pixel ``i`` (taken from its
+    unit-amplitude postage stamp, so it includes the PSF and the source's
+    amplitude) and ``sigma_i`` the per-pixel noise.  This is the expectation
+    of the optimal (matched-filter) flux estimator, i.e. how many sigma the
+    source's flux stands above the noise.  It uses the model rather than the
+    noisy data, so it is neither noise-biased nor circular (the *true*
+    parameters are used, never the recovered ones), and pixels with no source
+    flux drop out automatically.
+
+    Returns
+    -------
+    np.ndarray, shape (S,)
+        S/N per source, in the exposure's local source ordering.
+    """
+    stamps, i_all, j_all = gen.source_stamps(
+        positions, params,
+        image_width=gen.image_width,
+        image_height=gen.image_height,
+        pixel_scale=gen.pixel_scale,
+        postage_stamp_half_size=half_stamp,
+        n_wavelength_samples=n_lambda,
+        oversampling=oversampling,
+    )
+    counts = np.asarray(stamps) * EXPOSURE_TIME          # (S, ss, ss)
+    sig = np.asarray(sigma_img)[np.asarray(i_all), np.asarray(j_all)]
+    return np.sqrt(((counts / sig) ** 2).sum(axis=(1, 2)))
+
+
+def _compute_bright_mask(per_exposure_data, inf_exposures, n_sources,
+                         snr_threshold=SNR_THRESHOLD, min_bands=MIN_BANDS,
+                         n_lambda=N_LAMBDA, oversampling=2):
+    """Flag sources detected in enough distinct bands to be well measured.
+
+    For every exposure the detection S/N of each source is estimated with
+    :func:`_source_snr`, and the exposure's band is recorded whenever the
+    threshold is exceeded.  A source is "bright" if it clears the threshold
+    in at least ``min_bands`` **unique** bands.
+
+    Counting *bands* rather than exposures matters: a source repeatedly
+    observed in one band still only constrains a single point of its
+    spectrum, so it is not a useful case for judging recovered parameters.
+    Only sources actually present in an exposure are considered (via
+    ``src_idx``), so a source's S/N is never counted in a band it was not
+    observed in.
+
+    Returns
+    -------
+    np.ndarray of bool, shape (n_sources,)
+        True where the source was detected in >= ``min_bands`` bands.
+    """
+    detected = np.zeros((n_sources, len(_BANDS)), dtype=bool)
+
+    for k, (_, params, band, _, half_stamp, src_idx) in enumerate(
+        per_exposure_data
+    ):
+        _, sigma_img, positions, gen, _, _ = inf_exposures[k]
+        sigma_img = np.asarray(sigma_img)
+        snr = _source_snr(
+            gen, positions, params, sigma_img, half_stamp,
+            n_lambda=n_lambda, oversampling=oversampling,
+        )
+        above = snr > snr_threshold
+        if np.any(above):
+            detected[np.asarray(src_idx)[above], band - 1] = True
+
+    return detected.sum(axis=1) >= min_bands
+
+
 def end_to_end_mock(use_lm=False):
     print("=" * 60)
     print("SPHEREx Mock Exposure Simulation")
@@ -709,14 +792,14 @@ def end_to_end_mock(use_lm=False):
             inf_exposures,
             init_log_params,
             n_steps=1024,
-            learning_rate=5e-2,
+            learning_rate=1e-2,
             momentum=0.3,
             warmup_steps=16,
             n_lambda=N_LAMBDA,
             oversampling=2,
             precondition_rms=True,
             # Interleave direct amplitude least-squares solves with SGD
-            # (default amp_solve_every=10).
+            amp_solve_every=16,
             amp_verbose=True,
         )
 
@@ -804,25 +887,19 @@ def end_to_end_mock(use_lm=False):
     else:
         print("  Skipping loss-history plot (not tracked by the LM solver).")
 
-    # Bright sources: TRUE peak flux > 5x background in >=3 bands
-    # (simplified).  NOTE: two bugs fixed here:
-    # 1. Must use the TRUE amplitude, not the RECOVERED one - using the
-    #    recovered amplitude made the "bright" label circular/contaminated
-    #    by exactly the convergence issue being diagnosed (a source whose
-    #    amplitude estimate diverges upward would get mislabeled bright).
-    # 2. Must actually check per-exposure participation (that exposure's
-    #    own background level, and only for sources present in it via
-    #    src_idx) - the previous version ignored src_idx/gen/_hs entirely
-    #    and just added the same whole-catalog check unconditionally on
-    #    every loop iteration, regardless of which sources were actually
-    #    observed in that exposure.
-    true_A = np.exp(true_log_params[:, 0])
-    n_above = np.zeros(true_log_params.shape[0], dtype=int)
-    for k, (_noisy, _sigma, _pos, _gen, _hs, src_idx) in enumerate(inf_exposures):
-        idx = np.asarray(src_idx)
-        bg_level = np.exp(float(log_backgrounds[k]))
-        n_above[idx] += (true_A[idx] > 5.0 * bg_level).astype(int)
-    bright = n_above >= 3
+    # Bright sources: detected at S/N > SNR_THRESHOLD in >= MIN_BANDS distinct
+    # bands.  This uses the TRUE parameters throughout: using the recovered
+    # ones would make the label circular (a source whose amplitude estimate
+    # diverges upward would be "detected" precisely because of the
+    # convergence problem being diagnosed).  Counting unique bands rather
+    # than exposures avoids promoting a source that was simply observed many
+    # times in a single band.  See _source_snr / _compute_bright_mask.
+    bright = _compute_bright_mask(
+        per_exposure_data, inf_exposures, true_log_params.shape[0],
+        n_lambda=N_LAMBDA, oversampling=2,
+    )
+    print(f"  {int(bright.sum())} / {bright.size} sources are bright "
+          f"(S/N > {SNR_THRESHOLD} in >= {MIN_BANDS} bands)")
 
     plot_comparison(true_log_params, np.asarray(rec_log_params), bright,
                     os.path.join(PLOTS_DIR, "comparison.svg"))
