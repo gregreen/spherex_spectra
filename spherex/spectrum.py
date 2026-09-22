@@ -246,6 +246,18 @@ class NeuralNetSpectrum(eqx.Module):
         self.n_hidden_layers = n_hidden_layers
         self.hidden_size = hidden_size
 
+        # TODO: Spatial embedding: add hand-rolled Fourier features of the
+        # wavelength to the input vector:
+        # 
+        #    $\sin(k_i \lambda)$ and $cos(k_i \lambda)$
+        #    for $k_i = 2^i \pi / \Delta\lambda$ for $i=0,1,...,n_{freqs}-1$.
+        # 
+        # Model hyperparameters:
+        #    * n_freqs: number of Fourier features to add (default = 8,
+        #               corresponding to ~128 wavelength elements)
+        #    * delta_lambda: wavelength range to cover (default = 4.25 um,
+        #                    corresponding to 0.75 - 5.0 microns)
+
         # One key per Linear layer: input -> hidden, hidden -> hidden (x N),
         # hidden -> 1.
         keys = jax.random.split(key, n_hidden_layers + 2)
