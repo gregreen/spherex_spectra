@@ -51,7 +51,8 @@ _BANDS = {
 }
 
 
-def _build_band(band, psf_scale=1.0, lambda_slope_scale=1.0):
+def _build_band(band, psf_scale=1.0, lambda_slope_scale=1.0,
+                spectrum_model=None):
     """Build PSF, transmission, spectrum model, and aperture for a band.
 
     Parameters
@@ -66,6 +67,17 @@ def _build_band(band, psf_scale=1.0, lambda_slope_scale=1.0):
         downsampling factor when the detector image has been binned
         so that the wavelength range across the (fewer) pixels matches
         the full un-binned detector.
+    spectrum_model : equinox.Module, optional
+        Spectral *shape* template to use.  ``None`` (the default) builds a
+        fresh :class:`~spherex.spectrum.BlackbodySpectrum`, which preserves
+        the historical behaviour for every existing caller.  Pass an
+        explicit instance to substitute a different template - e.g. a
+        :class:`~spherex.spectrum.NeuralNetSpectrum`.
+
+        Pass the SAME instance for every band whenever the model carries
+        state, such as a neural network's weights: a per-band copy would give
+        each band a *different* spectrum.  Stateless models (the blackbody)
+        are unaffected either way, since they are cheap to rebuild.
 
     Returns
     -------
@@ -99,12 +111,13 @@ def _build_band(band, psf_scale=1.0, lambda_slope_scale=1.0):
     )
 
     # ---- spectrum ----------------------------------------------------------
-    # Shape-only blackbody template.  The amplitude is NOT part of the
+    # Shape-only spectrum template.  The amplitude is NOT part of the
     # spectrum model: it is carried as the first column of ``source_params``
     # and applied by the image generator (see ``spherex.spectrum``).  The
     # reference wavelength is the single global constant ``LAMBDA_0`` (never
     # band-specific) so the modelled spectrum stays smooth across bands.
-    spectrum_model = BlackbodySpectrum()
+    if spectrum_model is None:
+        spectrum_model = BlackbodySpectrum()
 
     return psf, transmission, spectrum_model, _APERTURE
 
@@ -133,6 +146,13 @@ class SpherexImageGenerator(ImageGenerator):
     psf_scale : float, optional
         Factor scaling the PSF FWHM (default 1).  Larger values make
         the wavelength-dependent PSF effects more visually apparent.
+    lambda_slope_scale : float, optional
+        Factor scaling the linear-variable-filter wavelength gradient
+        (default 1).
+    spectrum_model : equinox.Module, optional
+        Spectral shape template to use instead of the default
+        blackbody (see :func:`_build_band`).  When substituting a
+        stateful model, pass the SAME instance to every band.
 
     Call signature
     --------------
@@ -153,10 +173,12 @@ class SpherexImageGenerator(ImageGenerator):
         pixel_scale=_PIXEL_SCALE,
         psf_scale=1.0,
         lambda_slope_scale=1.0,
+        spectrum_model=None,
     ):
         psf, transmission, spectrum_model, aperture = _build_band(
             band, psf_scale=psf_scale,
             lambda_slope_scale=lambda_slope_scale,
+            spectrum_model=spectrum_model,
         )
 
         super().__init__(
@@ -234,10 +256,12 @@ class SpherexImageGenerator3(ImageGenerator3):
         pixel_scale=_PIXEL_SCALE,
         psf_scale=1.0,
         lambda_slope_scale=1.0,
+        spectrum_model=None,
     ):
         psf, transmission, spectrum_model, aperture = _build_band(
             band, psf_scale=psf_scale,
             lambda_slope_scale=lambda_slope_scale,
+            spectrum_model=spectrum_model,
         )
 
         super().__init__(

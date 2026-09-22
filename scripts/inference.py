@@ -1319,24 +1319,56 @@ def plot_loss_history(losses, learning_rates, fname, final_loss=None):
     print(f"Saved {fname}")
 
 
-def plot_comparison(true_params, recovered_params, bright_mask, fname):
-    """Scatter true vs recovered log(A) and log(T).  Bright sources
-    (``bright_mask``) are plotted in a different colour.
+def plot_comparison(true_params, recovered_params, bright_mask, fname,
+                    shape_labels=None, amplitude_label="log(A / (W/m2/um))"):
+    """Scatter true vs recovered log-amplitude and shape parameters.
 
-    Parameter layout is ``[log_amplitude, log_temperature]`` (amplitude
-    first - see ``spherex.spectrum``).
+    Bright sources (``bright_mask``) are plotted in a different colour.
+
+    Parameter layout is ``[log_amplitude, shape_params...]`` (amplitude
+    ALWAYS first - see ``spherex.spectrum``), so the figure has one panel per
+    parameter: ``1 + P`` panels for ``P`` shape parameters.  With the default
+    blackbody model (``P = 1``) that is the historical two-panel log(A)/log(T)
+    figure.
+
+    Parameters
+    ----------
+    true_params, recovered_params : np.ndarray, shape (N, 1 + P)
+        Parameter arrays, amplitude in column 0.
+    bright_mask : np.ndarray of bool, shape (N,)
+    fname : str
+    shape_labels : list of str, optional
+        One label per shape parameter (``P`` entries).  Defaults to
+        ``["log(T / kK)"]`` for a single shape parameter (the blackbody) and
+        ``["shape param 0", ...]`` otherwise, since a flexible model's
+        parameters have no universal name.
+    amplitude_label : str, optional
+        Label for the amplitude panel.
     """
-    true_A = true_params[:, 0]
-    true_T = true_params[:, 1]
-    rec_A = recovered_params[:, 0]
-    rec_T = recovered_params[:, 1]
+    true_params = np.asarray(true_params)
+    recovered_params = np.asarray(recovered_params)
+    n_shape = true_params.shape[1] - 1
+    if shape_labels is None:
+        shape_labels = (
+            ["log(T / kK)"] if n_shape == 1
+            else [f"shape param {k}" for k in range(n_shape)]
+        )
+    if len(shape_labels) != n_shape:
+        raise ValueError(
+            f"shape_labels has {len(shape_labels)} entries but the parameters "
+            f"have {n_shape} shape columns"
+        )
 
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+    labels = [amplitude_label] + list(shape_labels)
+    n_panels = len(labels)
 
-    for ax, true_vals, rec_vals, label in [
-        (ax1, true_A, rec_A, "log(A / (W/m2/um))"),
-        (ax2, true_T, rec_T, "log(T / kK)"),
-    ]:
+    fig, axes = plt.subplots(1, n_panels, figsize=(6 * n_panels, 5),
+                             squeeze=False)
+    axes = axes[0]
+
+    for ax, column, label in zip(axes, range(n_panels), labels):
+        true_vals = true_params[:, column]
+        rec_vals = recovered_params[:, column]
         ax.scatter(true_vals[~bright_mask], rec_vals[~bright_mask],
                    s=1, color="gray", alpha=0.3, rasterized=False)
         ax.scatter(true_vals[bright_mask], rec_vals[bright_mask],

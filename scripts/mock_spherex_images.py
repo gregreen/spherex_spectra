@@ -12,8 +12,10 @@ References
 
 import os
 import time
+import hashlib
 import argparse
 
+import equinox as eqx
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -22,10 +24,11 @@ from astropy.wcs import WCS
 from astropy import units as u
 from PIL import Image
 
-from spherex import SpherexImageGenerator, SpherexImageGenerator3, BlackbodySpectrum
+from spherex import (SpherexImageGenerator, SpherexImageGenerator3,
+                     BlackbodySpectrum, NeuralNetSpectrum)
 from spherex.config import _BANDS
 from spherex.constants import HC_JAX, TEMPERATURE_UNIT
-from spherex.spectrum import LAMBDA_0
+from spherex.spectrum import LAMBDA_0, split_source_params
 from spherex.plotting_utils import HistEqNormalize
 from jax.scipy.integrate import trapezoid
 import sys
@@ -99,29 +102,314 @@ BACKGROUND_FACTOR = 2.0  # >1 makes faintest stars below background
 N_LAMBDA = 1
 
 # ---------------------------------------------------------------------------
+# Spectrum model (the source's spectral SHAPE template)
+# ---------------------------------------------------------------------------
+# The mock can run with either analytic blackbodies or a frozen random neural
+# network.  In both cases the model describes only the SHAPE (normalised to
+# f_lambda = 1 at LAMBDA_0); the amplitude stays in the first column of
+# ``source_params`` and is drawn / inferred by the usual machinery.  Nothing
+# downstream of the shape (image generation, PSF, transmissions, the
+# amplitude solve, the optimisers) changes.
+#
+# "blackbody" : analytic BlackbodySpectrum, 1 shape parameter (log T).
+# "nn"        : NeuralNetSpectrum with FROZEN random weights; the number of
+#               shape parameters (theta) is free.
+SPECTRUM_KIND = "nn"
+
+# Neural-network hyperparameters (only used if SPECTRUM_KIND = "nn")
+NN_N_PARAMS = 1
+NN_N_HIDDEN_LAYERS = 2
+NN_HIDDEN_SIZE = 16
+NN_SEED = 314159
+
+# The randomly initialised network is rescaled so that its in-band
+# lambda_0-normalised log-shape has roughly this standard deviation over the
+# prior, i.e. |log shape| ~ 1-2 out to 2-4 sigma.  Without this the frozen
+# random net could produce spectra spanning many decades, which would move the
+# amplitude range / background / detection S/N regime away from the blackbody
+# run that the amplitudes were chosen for.
+NN_TARGET_LOG_SHAPE_STD = 0.5
+NN_RESCALE_SAMPLES = 64
+
+# Standard deviation of the INITIAL theta guess.  Kept separate from the theta
+# PRIOR (which is N(0, 1)) because the initialisation is deliberately
+# different for each model - as it also is for the blackbody, whose prior
+# (log of a uniform draw) is not the same as its initialisation (uniform in
+# log T).
+NN_INIT_STD = 1.0
+
+# Reference shape parameters used by the analytic (blackbody-style)
+# diagnostics: a plain 3000 K blackbody for the blackbody model, and theta = 0
+# for the neural network.  These only set the *reported* photon counts and the
+# background level - they do not target any photon count.
+REFERENCE_TEMPERATURE_K = 3.0
+
+# Blackbody temperature prior / initialisation bounds, log(kK).
+# Prior:        log T = log(U(3, 8) kK)
+# Init guess:   log T ~ U(LOG_T_BOUNDS)   (deliberately not the same draw)
+LOG_T_BOUNDS = np.log(
+    ([3000.0, 8000.0] * u.K).to(u.Unit(TEMPERATURE_UNIT)).value
+)
+
+# ---------------------------------------------------------------------------
+# Step 0: Spectrum model (shape template) + shape-parameter bookkeeping
+# ---------------------------------------------------------------------------
+# Everything model-specific about the mock lives in this block.  The rest of
+# the pipeline is generic in the number of shape parameters P: source
+# parameters are always ``[log_amplitude, theta_0, ..., theta_{P-1}]``.
+
+#: The single spectrum-model instance used by the WHOLE simulation.  Rebuilt
+#: (and replaced) at the start of each top-level entry point via
+#: :func:`_set_spectrum_model`.  It is never handed to an optimiser, so its
+#: weights are frozen by construction: the inference helpers differentiate only
+#: ``(log_params, log_backgrounds)`` and see the generator purely as a
+#: closed-over constant.
+SPECTRUM_MODEL = None
+
+
+def _is_blackbody(model):
+    """True if ``model`` is the analytic blackbody template."""
+    return isinstance(model, BlackbodySpectrum)
+
+
+def _wavelength_grid(n_points=256):
+    """Wavelength grid (um) spanning every SPHEREx band."""
+    lam_min = min(lo for lo, _hi, _r, _name in _BANDS.values())
+    lam_max = max(hi for _lo, hi, _r, _name in _BANDS.values())
+    return jnp.linspace(lam_min, lam_max, n_points)
+
+
+def _rescale_nn_output(model, key, target_std=NN_TARGET_LOG_SHAPE_STD,
+                       n_samples=NN_RESCALE_SAMPLES):
+    """Rescale a :class:`NeuralNetSpectrum` output layer to an O(1) log-shape.
+
+    ``NeuralNetSpectrum`` returns
+    ``exp(raw(lambda, theta) - raw(LAMBDA_0, theta))``, which is *exactly
+    linear* in the final layer's weight block: the final bias cancels in the
+    difference, so scaling that block by ``factor`` scales the log-shape by
+    exactly ``factor``.  One measurement therefore suffices - draw theta from
+    the prior, measure the log-shape's spread over the full wavelength range,
+    and scale the weight block to hit ``target_std``.
+
+    This keeps a *randomly initialised* network in the same dynamic range as
+    the blackbody it replaces, so the directly-specified amplitude range, the
+    background level and the resulting detection S/N all stay meaningful.
+
+    Returns
+    -------
+    (model, factor) : the rescaled model and the factor applied.
+    """
+    lambdas = _wavelength_grid()
+    thetas = jax.random.normal(key, (n_samples, model.n_params))
+
+    def _log_shape(theta):
+        ln_flux = jax.vmap(model.raw_neural_net, in_axes=(0, None))(
+            lambdas, theta
+        )
+        return ln_flux - model.raw_neural_net(LAMBDA_0, theta)
+
+    log_shape = jax.vmap(_log_shape)(thetas)          # (n_samples, n_lambda)
+    current = float(jnp.std(log_shape))
+    if not np.isfinite(current) or current <= 0.0:
+        return model, 1.0
+
+    factor = float(target_std) / current
+    last = len(model.layers) - 1
+    rescaled = eqx.tree_at(
+        lambda m: m.layers[last].weight,
+        model,
+        model.layers[last].weight * factor,
+    )
+    return rescaled, factor
+
+
+def _build_spectrum_model(
+    kind=SPECTRUM_KIND,
+    n_params=NN_N_PARAMS,
+    n_hidden_layers=NN_N_HIDDEN_LAYERS,
+    hidden_size=NN_HIDDEN_SIZE,
+    seed=NN_SEED,
+    *,
+    target_log_shape_std=NN_TARGET_LOG_SHAPE_STD,
+    verbose=True,
+):
+    """Build the (frozen) spectrum-shape template used by the mock.
+
+    Parameters
+    ----------
+    kind : {"blackbody", "nn"}
+    n_params : int
+        Number of shape parameters ``theta`` (neural-network model only).
+    n_hidden_layers, hidden_size : int
+    seed : int
+        Seed for the neural network's weight initialisation, and (with a
+        derived key) for the output rescaling.
+    target_log_shape_std : float
+        Target standard deviation of the ``LAMBDA_0``-normalised log-shape.
+
+    Returns
+    -------
+    equinox.Module
+        One instance, to be shared by every band.  Sharing matters for the
+        neural network, whose weights are state: a per-band copy would give
+        each band a different spectrum.
+    """
+    if kind == "blackbody":
+        model = BlackbodySpectrum()
+        if verbose:
+            print("  Spectrum model: analytic blackbody "
+                  f"(P = {model.n_params} shape parameter(s))")
+        return model
+
+    if kind != "nn":
+        raise ValueError(
+            f"Unknown spectrum kind {kind!r}; expected 'blackbody' or 'nn'"
+        )
+
+    model = NeuralNetSpectrum(
+        n_params, n_hidden_layers, hidden_size, key=jax.random.PRNGKey(seed)
+    )
+    model, factor = _rescale_nn_output(
+        model, jax.random.PRNGKey(seed + 1), target_log_shape_std
+    )
+    if verbose:
+        print(f"  Spectrum model: NeuralNetSpectrum(P={n_params}, "
+              f"layers={n_hidden_layers}, hidden={hidden_size}, "
+              f"seed={seed}), random weights FROZEN")
+        print(f"    output layer rescaled by {factor:.4g} to give an in-band "
+              f"log-shape std of ~{target_log_shape_std:g}")
+    return model
+
+
+def _set_spectrum_model(model):
+    """Install ``model`` as the module-level active spectrum model."""
+    global SPECTRUM_MODEL
+    SPECTRUM_MODEL = model
+    return model
+
+
+# Default active model: the analytic blackbody, built once at import so that
+# the helper functions below always have something to fall back on.  Every
+# top-level entry point replaces it via ``_set_spectrum_model``.
+SPECTRUM_MODEL = _build_spectrum_model(verbose=False)
+
+
+def _model_fingerprint(model):
+    """Order-stable fingerprint of every leaf of ``model``.
+
+    Used to prove the spectrum model is *frozen*: the weights must be
+    bit-identical before and after inference.
+    """
+    digest = hashlib.sha256()
+    for leaf in jax.tree_util.tree_leaves(model):
+        array = np.asarray(leaf)
+        digest.update(str(array.dtype).encode())
+        digest.update(str(array.shape).encode())
+        digest.update(np.ascontiguousarray(array).tobytes())
+    return digest.hexdigest()
+
+
+def _reference_shape_params(model=None):
+    """Reference shape parameters for the analytic diagnostics.
+
+    A 3000 K blackbody for the blackbody model, ``theta = 0`` for the neural
+    network.  Only the *reported* photon counts and the background level use
+    this, so it does not impose any photon-count target.
+    """
+    model = SPECTRUM_MODEL if model is None else model
+    if _is_blackbody(model):
+        return jnp.array([np.log(REFERENCE_TEMPERATURE_K)])
+    return jnp.zeros(model.n_params)
+
+
+def _draw_shape_params(rng, n_sources, model=None):
+    """Draw ``(n_sources, P)`` shape parameters from the model's PRIOR.
+
+    (For the neural network the prior is ``theta ~ N(0, I)`` per column; for
+    the blackbody it is ``log T = log(U(3, 8) kK)``.)
+    """
+    model = SPECTRUM_MODEL if model is None else model
+    if _is_blackbody(model):
+        temperatures = rng.uniform(
+            np.exp(LOG_T_BOUNDS[0]), np.exp(LOG_T_BOUNDS[1]), n_sources
+        )
+        return np.log(temperatures)[:, None]
+    return rng.standard_normal((n_sources, model.n_params))
+
+
+def _draw_init_shape_params(rng, n_sources, model=None):
+    """Draw ``(n_sources, P)`` INITIAL-GUESS shape parameters.
+
+    Deliberately *different* from :func:`_draw_shape_params` (and different
+    between models), so that the inference starts away from the prior's own
+    sampling distribution: the blackbody is initialised uniformly in log T,
+    the neural network from ``N(0, NN_INIT_STD^2)``.
+    """
+    model = SPECTRUM_MODEL if model is None else model
+    if _is_blackbody(model):
+        return rng.uniform(
+            LOG_T_BOUNDS[0], LOG_T_BOUNDS[1], (n_sources, 1)
+        )
+    return NN_INIT_STD * rng.standard_normal((n_sources, model.n_params))
+
+
+def _shape_param_labels(model=None):
+    """Human-readable label per shape parameter (length ``P``)."""
+    model = SPECTRUM_MODEL if model is None else model
+    if _is_blackbody(model):
+        return ["log(T / kK)"]
+    return [f"theta_{k}" for k in range(model.n_params)]
+
+
+def _describe_shape_params(shape_params, model=None):
+    """One-line summary of a ``(N, P)`` shape-parameter array."""
+    model = SPECTRUM_MODEL if model is None else model
+    shape_params = np.asarray(shape_params)
+    if _is_blackbody(model):
+        t = np.exp(shape_params[:, 0])
+        return f"T range: [{t.min():.1f}, {t.max():.1f}] kK"
+    return (f"theta range: [{shape_params.min():+.3f}, "
+            f"{shape_params.max():+.3f}] (P = {shape_params.shape[1]})")
+
+
+def _make_params(log_amplitudes, shape_params):
+    """Assemble ``(N, 1 + P)`` source parameters, amplitude FIRST.
+
+    The only place the parameter layout is constructed, so the amplitude-first
+    convention is enforced in exactly one spot.
+    """
+    return jnp.asarray(
+        np.column_stack([np.asarray(log_amplitudes), np.asarray(shape_params)]),
+        dtype=jnp.float32,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Step 1: Amplitude range + photon-count diagnostic
 # ---------------------------------------------------------------------------
 # Amplitudes are drawn directly in [AMPLITUDE_MIN, AMPLITUDE_MAX] (defined in
 # the configuration block above).  There is no photon-count *targeting*;
 # instead we report the detected counts implied by the chosen range.
 
-def _total_photons_per_exposure(band, amplitude, temperature_kK=3.0):
-    """Analytic detected photons per exposure for a blackbody source.
+def _total_photons_per_exposure(band, amplitude, model=None):
+    """Analytic detected photons per exposure for the active spectrum model.
 
     Integrates the telescope-collected photon rate over the band, including
     the Gaussian filter transmission, and multiplies by ``EXPOSURE_TIME``.
-    ``amplitude`` is f_lambda at LAMBDA_0 (W m^-2 um^-1).  Used only as a
-    diagnostic and to set the background level.
+    ``amplitude`` is f_lambda at LAMBDA_0 (W m^-2 um^-1).  The model's shape is
+    evaluated at the *reference* shape parameters
+    (:func:`_reference_shape_params`), so the count is a faithful
+    representative of the model's typical brightness.  Used only as a
+    diagnostic and to set the background level (no count targeting).
     """
+    model = SPECTRUM_MODEL if model is None else model
     lam_min, lam_max, R, _name = _BANDS[band]
     lambdas = jnp.linspace(lam_min, lam_max, 500)
     lam_mid = 0.5 * (lam_min + lam_max)
     sigma_t = lam_mid / (2.0 * jnp.sqrt(2.0 * jnp.log(2.0)) * R)
     T_weight = jnp.exp(-(lambdas - lam_mid) ** 2 / (2.0 * sigma_t ** 2))
 
-    shape = BlackbodySpectrum()(
-        lambdas, jnp.array([jnp.log(temperature_kK)])
-    )
+    shape = model(lambdas, _reference_shape_params(model))
     f_lam = amplitude * shape
 
     aperture = jnp.pi * (0.10) ** 2
@@ -129,16 +417,22 @@ def _total_photons_per_exposure(band, amplitude, temperature_kK=3.0):
     return float(rate) * EXPOSURE_TIME
 
 
-def _report_photon_counts():
+def _report_photon_counts(model=None):
     """Print the photon-count range implied by AMPLITUDE_MIN/AMPLITUDE_MAX."""
+    model = SPECTRUM_MODEL if model is None else model
+    if _is_blackbody(model):
+        reference = (f"log(T / kK) = {np.log(REFERENCE_TEMPERATURE_K):.3f} "
+                     f"(T = {REFERENCE_TEMPERATURE_K * 1000.0:.0f} K)")
+    else:
+        reference = "theta = 0"
     print("\n--- Amplitude range (specified directly, no count targeting) ---")
     print(f"  f_lambda(LAMBDA_0={LAMBDA_0} um) in "
           f"[{AMPLITUDE_MIN:.3e}, {AMPLITUDE_MAX:.3e}] W m^-2 um^-1")
+    print(f"  evaluated at the reference shape parameters: {reference}")
     for band in sorted(_BANDS):
-        lo = _total_photons_per_exposure(band, AMPLITUDE_MIN)
-        hi = _total_photons_per_exposure(band, AMPLITUDE_MAX)
-        print(f"  Band {band}: {lo:10.1f} - {hi:12.1f} photons / exposure "
-              f"(T = 3000 K)")
+        lo = _total_photons_per_exposure(band, AMPLITUDE_MIN, model)
+        hi = _total_photons_per_exposure(band, AMPLITUDE_MAX, model)
+        print(f"  Band {band}: {lo:10.1f} - {hi:12.1f} photons / exposure")
 
 
 # ---------------------------------------------------------------------------
@@ -146,14 +440,32 @@ def _report_photon_counts():
 # ---------------------------------------------------------------------------
 
 def _generate_catalog(rng, ra_center=None, dec_center=None,
-                       radius_deg=None):
-    """Return (skycoords, log_temperatures, log_amplitudes).
+                       radius_deg=None, model=None):
+    """Return (skycoords, shape_params, log_amplitudes).
 
     Sources are drawn uniformly from the surface of a sphere within a
     spherical cap of radius ``radius_deg`` centred on (``ra_center``,
-    ``dec_center``).  Amplitudes are power-law distributed (P(A) ∝ A^-alpha)
-    over the directly-specified range [AMPLITUDE_MIN, AMPLITUDE_MAX].
+    ``dec_center``).  Shape parameters come from the *active model's prior*
+    (``log T = log(U(3, 8) kK)`` for the blackbody, ``theta ~ N(0, I)`` for the
+    neural network) and amplitudes are power-law distributed
+    (P(A) ∝ A^-alpha) over the directly-specified range
+    [AMPLITUDE_MIN, AMPLITUDE_MAX].
+
+    Parameters
+    ----------
+    rng : np.random.Generator
+    ra_center, dec_center, radius_deg : float, optional
+    model : equinox.Module, optional
+        Spectrum model whose prior to draw from; defaults to the module-level
+        :data:`SPECTRUM_MODEL`.
+
+    Returns
+    -------
+    skycoords : SkyCoord, shape (N_SOURCES,)
+    shape_params : np.ndarray, shape (N_SOURCES, P)
+    log_amplitudes : np.ndarray, shape (N_SOURCES,)
     """
+    model = SPECTRUM_MODEL if model is None else model
     if ra_center is None:
         ra_center = CATALOG_CENTER.ra.deg
     if dec_center is None:
@@ -175,12 +487,8 @@ def _generate_catalog(rng, ra_center=None, dec_center=None,
         phi * u.rad, theta * u.rad
     )
 
-    # log-Temperatures  U(log(3), log(8))  [log(kK)]
-    log_temperatures = np.log(rng.uniform(
-        (3000 * u.K).to(u.Unit(TEMPERATURE_UNIT)).value,
-        (8000 * u.K).to(u.Unit(TEMPERATURE_UNIT)).value,
-        N_SOURCES,
-    ))
+    # Spectral shape parameters, drawn from the model's prior.
+    shape_params = _draw_shape_params(rng, N_SOURCES, model)
 
     # Amplitudes: truncated power-law  P(A) ∝ A^{-alpha}
     alpha = AMPLITUDE_ALPHA
@@ -194,7 +502,7 @@ def _generate_catalog(rng, ra_center=None, dec_center=None,
     amplitudes = (A_min_exp + u_vals * (A_max_exp - A_min_exp)) ** (1.0 / exp)
     log_amplitudes = np.log(amplitudes)
 
-    return skycoords, log_temperatures, log_amplitudes
+    return skycoords, shape_params, log_amplitudes
 
 
 # ---------------------------------------------------------------------------
@@ -249,13 +557,16 @@ def _generate_exposures(rng):
 # Step 4: Filter sources per exposure
 # ---------------------------------------------------------------------------
 
-def _filter_sources(skycoords, log_temperatures, log_amplitudes, exposures):
+def _filter_sources(skycoords, shape_params, log_amplitudes, exposures):
     """Filter to sources observed in at least one exposure.
 
     Returns
     -------
-    skycoords, log_temperatures, log_amplitudes  (filtered, log-space)
+    skycoords, shape_params, log_amplitudes  (filtered)
     per_exposure_data : list of (positions_pix, params_array, band, wcs, half_stamp, src_idx)
+        ``params_array`` has shape ``(n_in, 1 + P)``: the log-amplitude first,
+        then the ``P`` shape parameters (see ``spherex.spectrum``).  This works
+        for any ``P`` - the blackbody simply has ``P = 1``.
     """
     n_total = len(skycoords)
     in_any = np.zeros(n_total, dtype=bool)
@@ -284,14 +595,9 @@ def _filter_sources(skycoords, log_temperatures, log_amplitudes, exposures):
         positions_pix = jnp.stack(
             [jnp.asarray(x_px), jnp.asarray(y_px)], axis=-1
         )
-        # source_params = [log_amplitude, log_temperature]  (amplitude FIRST)
-        params = jnp.stack(
-            [
-                jnp.asarray(log_amplitudes[in_this], dtype=jnp.float32),
-                jnp.asarray(log_temperatures[in_this], dtype=jnp.float32),
-            ],
-            axis=-1,
-        )
+        # source_params = [log_amplitude, theta_0, ..., theta_{P-1}]
+        # (amplitude ALWAYS first; shape columns follow, whatever P is).
+        params = _make_params(log_amplitudes[in_this], shape_params[in_this])
 
         per_exposure_data.append(
             (positions_pix, params, band, wcs, half_stamp,
@@ -303,10 +609,11 @@ def _filter_sources(skycoords, log_temperatures, log_amplitudes, exposures):
     print(f"\nKeeping {n_kept} / {n_total} sources (in ≥1 exposure)")
 
     skycoords_filt = skycoords[in_any]
-    log_temperatures_filt = log_temperatures[in_any]
+    shape_params_filt = shape_params[in_any]
     log_amplitudes_filt = log_amplitudes[in_any]
 
-    return skycoords_filt, log_temperatures_filt, log_amplitudes_filt, per_exposure_data
+    return (skycoords_filt, shape_params_filt, log_amplitudes_filt,
+            per_exposure_data)
 
 
 # ---------------------------------------------------------------------------
@@ -314,13 +621,15 @@ def _filter_sources(skycoords, log_temperatures, log_amplitudes, exposures):
 # ---------------------------------------------------------------------------
 
 
-def _compute_background(band):
+def _compute_background(band, model=None):
     """Estimate the background level so the faintest stars sit below it.
 
-    Computes the approximate peak pixel rate for a T=3000 K blackbody with
-    amplitude ``AMPLITUDE_MIN`` at the band-centre wavelength, then scales
-    by ``BACKGROUND_FACTOR``.
+    Computes the approximate peak pixel rate for an ``AMPLITUDE_MIN`` source
+    with the *active* spectrum model at its reference shape parameters (a
+    3000 K blackbody for the blackbody model, ``theta = 0`` for the neural
+    network), then scales by ``BACKGROUND_FACTOR``.
     """
+    model = SPECTRUM_MODEL if model is None else model
     lam_min, lam_max, R, _name = _BANDS[band]
     lam_mid = 0.5 * (lam_min + lam_max)
 
@@ -330,11 +639,9 @@ def _compute_background(band):
     psf_peak = 1.0 / (2.0 * np.pi * sigma_psf**2)  # arcsec^-2
 
     # Flux density at band centre: amplitude (f_lambda at LAMBDA_0) times the
-    # dimensionless blackbody *shape*.
-    bb = BlackbodySpectrum()
+    # dimensionless spectrum *shape*.
     lam_arr = jnp.array([lam_mid])
-    T_ref = (3000 * u.K).to(u.Unit(TEMPERATURE_UNIT)).value
-    shape = bb(lam_arr, jnp.array([np.log(T_ref)]))
+    shape = model(lam_arr, _reference_shape_params(model))
     f_lam = float(AMPLITUDE_MIN * shape[0])       # W / (m^2 um)
 
     # Effective bandwidth of the Gaussian transmission
@@ -360,15 +667,19 @@ def _compute_background(band):
     return background
 
 
-def _generate_and_save(per_exposure_data):
+def _generate_and_save(per_exposure_data, model=None):
     """For each exposure, generate an image (timed) and save as PNG.
+
+    Every band's generator is built with the SAME ``model`` instance, so a
+    stateful spectrum model (a neural network) produces one consistent
+    spectrum per source across all bands.
 
     Returns
     -------
     inference_exposures : list of (noisy_img, sigma_img, wcs, gen_module)
     noisy_vmins, noisy_vmaxs : per-exposure stretch bounds
-    true_params_all : (N, 2) log-params of all sources used anywhere
     """
+    model = SPECTRUM_MODEL if model is None else model
     os.makedirs(PLOTS_DIR, exist_ok=True)
     band_generators = {}  # reuse per band
     inference_exposures = []
@@ -386,6 +697,7 @@ def _generate_and_save(per_exposure_data):
                 image_width=DETECTOR_PIXELS,
                 image_height=DETECTOR_PIXELS,
                 lambda_slope_scale=DOWNSAMPLE,
+                spectrum_model=model,
             )
         gen = band_generators[band]
 
@@ -412,7 +724,7 @@ def _generate_and_save(per_exposure_data):
         # same way - previously only the background was, which
         # systematically under-counted the source flux relative to a
         # correctly-scaled background).
-        bg = _compute_background(band)
+        bg = _compute_background(band, model)
         img_with_bg = (img_np + bg) * EXPOSURE_TIME
         # img_noisy = np.random.default_rng(i).poisson(img_with_bg)
         # sigma should reflect the TRUE Poisson variance of the simulated
@@ -611,22 +923,150 @@ def _compute_bright_mask(per_exposure_data, inf_exposures, n_sources,
     return detected.sum(axis=1) >= min_bands
 
 
-def end_to_end_mock(use_lm=False):
+def plot_spectra_comparison(true_params, recovered_params, bright_mask,
+                            model=None,
+                            fname=os.path.join(PLOTS_DIR,
+                                               "spectra_comparison.svg"),
+                            max_sources=32, n_points=400):
+    """Overlay the true and recovered spectrum SHAPES of the brightest sources.
+
+    A scatter plot of true vs recovered shape parameters (``plot_comparison``)
+    is only directly interpretable when those parameters have a physical
+    meaning - ``log T`` for a blackbody.  For a flexible model, and especially
+    for the randomly initialised neural network, they do not: what matters is
+    whether the recovered *spectrum* matches the true one.  This plots
+    ``shape(lambda)`` for the ``max_sources`` brightest sources (ranked by true
+    amplitude, i.e. by ``f_lambda(LAMBDA_0)``) at their true (solid) and
+    recovered (dashed) shape parameters, over the full SPHEREx wavelength
+    range, and prints the median absolute log-shape error.
+
+    Parameters
+    ----------
+    true_params, recovered_params : np.ndarray, shape (N, 1 + P)
+    bright_mask : np.ndarray of bool, shape (N,)
+    model : equinox.Module, optional
+        Model used to turn shape parameters into spectra; defaults to the
+        module-level :data:`SPECTRUM_MODEL`.
+    fname : str
+    max_sources : int
+        Maximum number of sources to draw (keeps the figure readable).
+    n_points : int
+        Number of wavelengths in the plotted grid.
+    """
+    model = SPECTRUM_MODEL if model is None else model
+    true_params = np.asarray(true_params)
+    recovered_params = np.asarray(recovered_params)
+    bright_mask = np.asarray(bright_mask)
+
+    _, true_shape = split_source_params(true_params)
+    _, rec_shape = split_source_params(recovered_params)
+
+    bright_idx = np.where(bright_mask)[0]
+    if bright_idx.size == 0:
+        print("  No bright sources; skipping the spectra comparison plot.")
+        return
+
+    # "Brightest" proxy: the largest true amplitude (which IS f_lambda at
+    # LAMBDA_0, thanks to the amplitude-first convention).
+    order = bright_idx[np.argsort(true_params[bright_idx, 0])[::-1]]
+    selected = order[:max_sources]
+
+    lambdas = _wavelength_grid(n_points)
+    lam_np = np.asarray(lambdas)
+
+    fig, ax = plt.subplots(figsize=(9, 5.5))
+    errors = []
+    for i in selected:
+        true_s = np.asarray(
+            model(lambdas, jnp.asarray(true_shape[i], jnp.float32))
+        )
+        rec_s = np.asarray(
+            model(lambdas, jnp.asarray(rec_shape[i], jnp.float32))
+        )
+        ax.plot(lam_np, true_s, color="C0", alpha=0.5, lw=1.0)
+        ax.plot(lam_np, rec_s, color="C3", alpha=0.5, lw=1.0, ls="--")
+        good = (np.isfinite(true_s) & np.isfinite(rec_s)
+                & (true_s > 0) & (rec_s > 0))
+        if np.any(good):
+            errors.append(
+                np.abs(np.log(rec_s[good]) - np.log(true_s[good]))
+            )
+
+    # Band boundaries, so it is obvious which parts of the spectrum each
+    # exposure actually samples.
+    for band in sorted(_BANDS):
+        lo, hi, _r, _name = _BANDS[band]
+        ax.axvline(lo, color="gray", lw=0.5, alpha=0.4)
+        ax.text(0.5 * (lo + hi), 0.99, f"{band}",
+                transform=ax.get_xaxis_transform(),
+                ha="center", va="top", fontsize=7, color="gray")
+    ax.axvline(_BANDS[max(_BANDS)][1], color="gray", lw=0.5, alpha=0.4)
+    ax.axvline(LAMBDA_0, color="k", lw=0.7, alpha=0.4, ls=":")
+    ax.text(LAMBDA_0, 0.02, f"LAMBDA_0", transform=ax.get_xaxis_transform(),
+            ha="left", va="bottom", fontsize=7, color="k")
+
+    ax.set_yscale("log")
+    ax.set_xlim(lam_np.min(), lam_np.max())
+    ax.set_xlabel("Wavelength [um]")
+    ax.set_ylabel(f"Shape  (f_lambda / f_lambda(LAMBDA_0={LAMBDA_0} um))")
+    ax.plot([], [], color="C0", lw=1.5, label="True")
+    ax.plot([], [], color="C3", lw=1.5, ls="--", label="Recovered")
+    ax.legend(loc="upper right", fontsize=8)
+    ax.set_title(f"Spectra of the {len(selected)} brightest sources "
+                 f"({_spectrum_model_name(model)})")
+    fig.tight_layout()
+    os.makedirs(PLOTS_DIR, exist_ok=True)
+    fig.savefig(fname, dpi=150)
+    plt.close(fig)
+    print(f"Saved {fname}")
+
+    if errors:
+        err = np.concatenate(errors)
+        print(f"  Median |Delta log shape| over bright sources: "
+              f"{np.median(err):.4f} dex "
+              f"(90th pct {np.percentile(err, 90):.4f})")
+
+
+def _spectrum_model_name(model=None):
+    """Short human-readable name of the active spectrum model."""
+    model = SPECTRUM_MODEL if model is None else model
+    if _is_blackbody(model):
+        return "blackbody"
+    return (f"neural net, P={model.n_params}, "
+            f"{model.n_hidden_layers}x{model.hidden_size}")
+
+
+def end_to_end_mock(use_lm=False, spectrum_model=None):
+    """Run the full mock simulation, inference and diagnostics.
+
+    Parameters
+    ----------
+    use_lm : bool
+        Use Levenberg-Marquardt instead of SGD for the inference step.
+    spectrum_model : equinox.Module, optional
+        Spectrum-shape template to simulate with.  ``None`` builds the default
+        (see :data:`SPECTRUM_KIND`).  The SAME instance is injected into every
+        band's generator and is never handed to an optimiser, so its weights
+        stay frozen.
+    """
+    if spectrum_model is None:
+        spectrum_model = _build_spectrum_model()
+    _set_spectrum_model(spectrum_model)
+
     print("=" * 60)
     print("SPHEREx Mock Exposure Simulation")
     print("=" * 60)
 
     # ---- Step 1: amplitude range + photon-count diagnostic ----------------
     print("\n--- Step 1: Amplitude range ---")
-    _report_photon_counts()
+    _report_photon_counts(spectrum_model)
 
     # ---- Step 2: catalog --------------------------------------------------
     print("\n--- Step 2: Generating source catalog ---")
     rng = np.random.default_rng(42)
-    skycoords, log_temperatures, log_amplitudes = _generate_catalog(rng)
+    skycoords, shape_params, log_amplitudes = _generate_catalog(rng)
     print(f"  Generated {N_SOURCES} sources")
-    print(f"  T range: [{np.exp(log_temperatures).min():.1f}, "
-          f"{np.exp(log_temperatures).max():.1f}] kK")
+    print(f"  {_describe_shape_params(shape_params, spectrum_model)}")
     print(f"  A range: [{np.exp(log_amplitudes).min():.4e}, "
           f"{np.exp(log_amplitudes).max():.4e}]")
 
@@ -654,13 +1094,13 @@ def end_to_end_mock(use_lm=False):
     # ---- Step 4: filter sources -------------------------------------------
     print("\n--- Step 4: Filtering sources per exposure ---")
     _, _, _, per_exposure_data = _filter_sources(
-        skycoords, log_temperatures, log_amplitudes, exposures
+        skycoords, shape_params, log_amplitudes, exposures
     )
 
     # ---- Step 5 + 6: generate & save ---------------------------------------
     print("\n--- Steps 5 & 6: Generating and saving images ---")
     inf_exposures, noisy_vmins, noisy_vmaxs = _generate_and_save(
-        per_exposure_data
+        per_exposure_data, spectrum_model
     )
 
     # ---- Step 7: inference -------------------------------------------------
@@ -674,26 +1114,29 @@ def end_to_end_mock(use_lm=False):
     # unfiltered catalog) - indexing with a filtered/compacted array here
     # would silently select the wrong source's parameters for most
     # sources.
-    # Parameter layout is [log_amplitude, log_temperature]: the amplitude is
-    # ALWAYS the first column (see ``spherex.spectrum``).
+    # Parameter layout is [log_amplitude, theta_0, ..., theta_{P-1}]: the
+    # amplitude is ALWAYS the first column (see ``spherex.spectrum``).
     true_log_params = np.column_stack([
-        log_amplitudes, log_temperatures
+        log_amplitudes, shape_params
     ]).astype(np.float32)
 
-    # Initial guess: random values within the prior bounds
+    # Initial guess: amplitudes uniform within their prior range, shape
+    # parameters from the model-specific initialisation (which is deliberately
+    # NOT the same draw as the prior - see _draw_init_shape_params).
     rng_inf = np.random.default_rng(99)
-    ln_teff_bounds = np.log(([3000.,8000.] * u.K).to(u.Unit(TEMPERATURE_UNIT)).value)
+    n_sources = true_log_params.shape[0]
     init_log_params = np.column_stack([
         rng_inf.uniform(
-            np.log(AMPLITUDE_MIN), np.log(AMPLITUDE_MAX),
-            true_log_params.shape[0]
+            np.log(AMPLITUDE_MIN), np.log(AMPLITUDE_MAX), n_sources
         ),
-        rng_inf.uniform(
-            ln_teff_bounds[0],
-            ln_teff_bounds[1],
-            true_log_params.shape[0],
-        ),
+        _draw_init_shape_params(rng_inf, n_sources, spectrum_model),
     ]).astype(np.float32)
+
+    # The spectrum model must stay FROZEN: only (log_params, log_backgrounds)
+    # are ever handed to an optimiser, and the generator is a closed-over
+    # constant, so no code path should be able to touch these weights.
+    # Fingerprint them here and re-check after inference.
+    model_fingerprint_before = _model_fingerprint(spectrum_model)
 
     # # Initial guess: perturb true values
     # rng_inf = np.random.default_rng(99)
@@ -706,7 +1149,8 @@ def end_to_end_mock(use_lm=False):
     # model or in how the noise / sigma was generated, rather than an
     # optimisation failure.
     true_log_backgrounds = np.log([
-        _compute_background(band) for _, _, band, _, _, _ in per_exposure_data
+        _compute_background(band, spectrum_model)
+        for _, _, band, _, _, _ in per_exposure_data
     ]).astype(np.float32)
     # NOTE: n_lambda must match the ``n_wavelength_samples`` used when
     # generating the images (N_LAMBDA, see ``_generate_and_save``) - using
@@ -811,6 +1255,19 @@ def end_to_end_mock(use_lm=False):
     )
     print(f"\nLoss (chi^2 / pixel) at RECOVERED parameters: {final_loss:.4f}")
 
+    # ---- spectrum model must be unchanged (frozen weights) ------------------
+    # Freezing is automatic: only (log_params, log_backgrounds) are handed to
+    # the optimiser and the generator is a closed-over constant.  Re-check the
+    # fingerprint anyway, so a future refactor that accidentally makes the
+    # generator a dynamic JAX argument (the only way the weights could turn
+    # into traced values) is caught here rather than silently invalidating
+    # the run.
+    if _model_fingerprint(spectrum_model) == model_fingerprint_before:
+        print("  Spectrum model weights unchanged (frozen) ✔")
+    else:
+        print("  ⚠ WARNING: spectrum model weights CHANGED during inference - "
+              "they are supposed to be frozen!")
+
     # ---- Step 8: predicted + residual images --------------------------------
     print("\n--- Step 8: Generating predicted and residual images ---")
     for k, (noisy_img, sigma_img, pos, gen, half_stamp, src_idx) in enumerate(inf_exposures):
@@ -902,7 +1359,17 @@ def end_to_end_mock(use_lm=False):
           f"(S/N > {SNR_THRESHOLD} in >= {MIN_BANDS} bands)")
 
     plot_comparison(true_log_params, np.asarray(rec_log_params), bright,
-                    os.path.join(PLOTS_DIR, "comparison.svg"))
+                    os.path.join(PLOTS_DIR, "comparison.svg"),
+                    shape_labels=_shape_param_labels(spectrum_model))
+
+    # Shape-parameter recovery is only directly interpretable when the
+    # parameters have a physical meaning (log T for a blackbody).  For a
+    # flexible model - especially a random neural network - the meaningful
+    # check is whether the recovered *spectrum* matches the true one, so the
+    # two are overlaid for the brightest sources.
+    plot_spectra_comparison(true_log_params, np.asarray(rec_log_params), bright,
+                            spectrum_model,
+                            os.path.join(PLOTS_DIR, "spectra_comparison.svg"))
 
     print("\nDone.")
 
@@ -912,22 +1379,34 @@ def end_to_end_mock(use_lm=False):
 # Benchmarking (not a formal test - for timing/perf investigation)
 # ---------------------------------------------------------------------------
 
-def _build_generators(bands, cls):
-    """Build one generator of class ``cls`` per band in ``bands``."""
+def _build_generators(bands, cls, model=None):
+    """Build one generator of class ``cls`` per band in ``bands``.
+
+    All bands share the SAME spectrum-model instance (required for a stateful
+    model such as the neural network).
+    """
+    model = SPECTRUM_MODEL if model is None else model
     return {
         band: cls(band=band, psf_scale=PSF_SCALE,
-                  image_width=DETECTOR_PIXELS, image_height=DETECTOR_PIXELS)
+                  image_width=DETECTOR_PIXELS, image_height=DETECTOR_PIXELS,
+                  spectrum_model=model)
         for band in bands
     }
 
 
-def _perturb_params(log_temperatures, log_amplitudes, rng, scale=0.05):
-    """Return a fresh perturbation of the log-parameters (new draw each
-    call), used to force re-computation (not just re-tracing) across
-    benchmark repeats."""
-    dT = rng.normal(0.0, scale, size=log_temperatures.shape)
-    dA = rng.normal(0.0, scale, size=log_amplitudes.shape)
-    return log_temperatures + dT, log_amplitudes + dA
+def _perturb_params(shape_params, log_amplitudes, rng, scale=0.05):
+    """Return a fresh perturbation of the parameters (new draw each call),
+    used to force re-computation (not just re-tracing) across benchmark
+    repeats.
+
+    ``shape_params`` is the ``(N, P)`` shape block (columns 1 onward of
+    ``source_params``); it is perturbed independently for any ``P``.
+    """
+    shape_params = np.asarray(shape_params)
+    log_amplitudes = np.asarray(log_amplitudes)
+    d_shape = rng.normal(0.0, scale, size=shape_params.shape)
+    d_A = rng.normal(0.0, scale, size=log_amplitudes.shape)
+    return shape_params + d_shape, log_amplitudes + d_A
 
 
 # ---------------------------------------------------------------------------
@@ -936,6 +1415,7 @@ def _perturb_params(log_temperatures, log_amplitudes, rng, scale=0.05):
 
 def compare_n_lambda(n_lambda_values=(1, 3, 15, 63), oversampling=2,
                      exposure_index=0,
+                     spectrum_model=None,
                      fname=os.path.join(PLOTS_DIR, "n_lambda_comparison.png")):
     """Generate one exposure's image at several ``n_lambda`` (wavelength
     sample count) values and compare them.
@@ -962,15 +1442,19 @@ def compare_n_lambda(n_lambda_values=(1, 3, 15, 63), oversampling=2,
     if len(n_lambda_values) < 2:
         raise ValueError("n_lambda_values must have at least 2 entries")
 
+    spectrum_model = _set_spectrum_model(
+        _build_spectrum_model() if spectrum_model is None else spectrum_model
+    )
+
     print("=" * 60)
     print("n_lambda resolution comparison")
     print("=" * 60)
 
     rng = np.random.default_rng(42)
-    skycoords, log_temperatures, log_amplitudes = _generate_catalog(rng)
+    skycoords, shape_params, log_amplitudes = _generate_catalog(rng)
     exposures = _generate_exposures(rng)
     _, _, _, per_exposure_data = _filter_sources(
-        skycoords, log_temperatures, log_amplitudes, exposures
+        skycoords, shape_params, log_amplitudes, exposures
     )
 
     positions_pix, params, band, wcs, half_stamp, src_idx = (
@@ -982,6 +1466,7 @@ def compare_n_lambda(n_lambda_values=(1, 3, 15, 63), oversampling=2,
     gen = SpherexImageGenerator3(
         band=band, psf_scale=PSF_SCALE,
         image_width=DETECTOR_PIXELS, image_height=DETECTOR_PIXELS,
+        spectrum_model=spectrum_model,
     )
 
     images = []
@@ -1060,7 +1545,8 @@ def compare_n_lambda(n_lambda_values=(1, 3, 15, 63), oversampling=2,
     print(f"\nSaved {fname}")
 
 
-def run_benchmark(n_repeats=5, source_batch_sizes=(None, 8, 32)):
+def run_benchmark(n_repeats=5, source_batch_sizes=(None, 8, 32),
+                  spectrum_model=None):
     """Benchmark image generation (image.py vs image3.py) and inference
     (legacy per-exposure JIT vs per-band-grouped batched JIT).
 
@@ -1072,11 +1558,15 @@ def run_benchmark(n_repeats=5, source_batch_sizes=(None, 8, 32)):
     print("SPHEREx Benchmark")
     print("=" * 60)
 
+    spectrum_model = _set_spectrum_model(
+        _build_spectrum_model() if spectrum_model is None else spectrum_model
+    )
+
     rng = np.random.default_rng(42)
-    skycoords, log_temperatures, log_amplitudes = _generate_catalog(rng)
+    skycoords, shape_params, log_amplitudes = _generate_catalog(rng)
     exposures = _generate_exposures(rng)
     _, _, _, per_exposure_data = _filter_sources(
-        skycoords, log_temperatures, log_amplitudes, exposures
+        skycoords, shape_params, log_amplitudes, exposures
     )
 
     bands_present = sorted({band for _, _, band, _, _, _ in per_exposure_data})
@@ -1084,8 +1574,10 @@ def run_benchmark(n_repeats=5, source_batch_sizes=(None, 8, 32)):
           f"{len(per_exposure_data)} exposures, "
           f"{sum(p.shape[0] for p, *_ in per_exposure_data)} total source-obs")
 
-    gens1 = _build_generators(bands_present, SpherexImageGenerator)
-    gens3 = _build_generators(bands_present, SpherexImageGenerator3)
+    gens1 = _build_generators(bands_present, SpherexImageGenerator,
+                              spectrum_model)
+    gens3 = _build_generators(bands_present, SpherexImageGenerator3,
+                              spectrum_model)
 
     # ---- Part 1: image-generation timing --------------------------------
     print("\n--- Image generation: image.py vs image3.py ---")
@@ -1105,20 +1597,16 @@ def run_benchmark(n_repeats=5, source_batch_sizes=(None, 8, 32)):
         gen3 = gens3[band]
 
         # Fresh perturbation per repeat forces real recomputation.
-        n_src = params.shape[0]
-        base_T = np.asarray(params[:, 0])
-        base_A = np.asarray(params[:, 1])
-        # source_params layout is [log_amplitude, log_temperature].
+        # source_params layout is [log_amplitude, theta_0, ..., theta_{P-1}].
         n_src = params.shape[0]
         base_A = np.asarray(params[:, 0])
-        base_T = np.asarray(params[:, 1])
+        base_shape = np.asarray(params[:, 1:])
 
         ref_img = None
         for rep in range(n_repeats):
-            pT, pA = _perturb_params(base_T, base_A, perturb_rng)
-            p = jnp.stack(
-                [jnp.asarray(pA, jnp.float32), jnp.asarray(pT, jnp.float32)],
-                axis=-1,
+            p_shape, pA = _perturb_params(base_shape, base_A, perturb_rng)
+            p = jnp.asarray(
+                np.column_stack([pA, p_shape]), dtype=jnp.float32
             )
 
             t0 = time.perf_counter()
@@ -1165,10 +1653,10 @@ def run_benchmark(n_repeats=5, source_batch_sizes=(None, 8, 32)):
 
     # ---- Part 2: inference timing ----------------------------------------
     print("\n--- Inference: batched=False vs batched=True ---")
-    inf_exposures, _, _ = _generate_and_save(per_exposure_data)
+    inf_exposures, _, _ = _generate_and_save(per_exposure_data, spectrum_model)
 
     init_log_params = np.column_stack(
-        [log_amplitudes, log_temperatures]
+        [log_amplitudes, shape_params]
     ).astype(np.float32)
     init_log_params += 0.05 * np.random.default_rng(1).standard_normal(
         init_log_params.shape
@@ -1189,6 +1677,116 @@ def run_benchmark(n_repeats=5, source_batch_sizes=(None, 8, 32)):
     print("\nBenchmark done.")
 
 
+# ---------------------------------------------------------------------------
+# Spectrum-model pre-flight check (not a formal test)
+# ---------------------------------------------------------------------------
+
+def nn_shape_check(model=None, n_samples=64, n_points=400, seed=NN_SEED + 2,
+                   fname=os.path.join(PLOTS_DIR, "shape_check.svg")):
+    """Pre-flight diagnostic for the active spectrum model.
+
+    Answers the questions that decide whether an inference run with this model
+    can be trusted at all, *before* waiting for that run:
+
+    1. **Does the shape parameter actually change the in-band shape?**  If it
+       does not, the parameters are unidentifiable in principle and any
+       recovered values are meaningless.  Measured directly from the
+       sensitivity matrix ``d log shape / d theta`` restricted to the sampled
+       wavelengths: a near-zero singular value is a direction that leaves the
+       spectrum unchanged.
+    2. **Is the in-band shape O(1)?**  A random network whose spectra span many
+       decades moves the amplitude range / background / detection S/N regime
+       away from the blackbody run the amplitudes were chosen for.  Reported as
+       the per-band log-shape dynamic range over ``theta`` drawn from the
+       prior.
+
+    Also plots ``shape(lambda; theta)`` over the full SPHEREx wavelength range
+    and prints the implied photon counts for the directly specified amplitude
+    range.
+    """
+    model = _set_spectrum_model(
+        _build_spectrum_model() if model is None else model
+    )
+
+    print("=" * 60)
+    print("Spectrum-model shape check")
+    print("=" * 60)
+    print(f"  Model: {_spectrum_model_name(model)}")
+
+    lambdas = _wavelength_grid(n_points)
+    lam_np = np.asarray(lambdas)
+    rng = np.random.default_rng(seed)
+    theta = _draw_shape_params(rng, n_samples, model)
+    theta_j = jnp.asarray(theta, dtype=jnp.float32)
+
+    shapes = np.asarray(jax.vmap(lambda th: model(lambdas, th))(theta_j))
+
+    # ---- 1. per-band log-shape dynamic range ------------------------------
+    print(f"\n--- In-band log-shape range over {n_samples} draws from the "
+          f"prior ---")
+    for band in sorted(_BANDS):
+        lo, hi, _r, _name = _BANDS[band]
+        inside = (lam_np >= lo) & (lam_np <= hi)
+        if not np.any(inside):
+            continue
+        log_shape = np.log(shapes[:, inside])
+        lo_med, hi_med = np.median(log_shape.min(axis=1)), \
+            np.median(log_shape.max(axis=1))
+        lo_w, hi_w = np.percentile(log_shape.min(axis=1), 5), \
+            np.percentile(log_shape.max(axis=1), 95)
+        print(f"  Band {band} [{lo:.2f}-{hi:.2f} um]: "
+              f"[{lo_med:+.2f}, {hi_med:+.2f}] (median), "
+              f"[{lo_w:+.2f}, {hi_w:+.2f}] (5-95%)")
+    print("  (band 1 contains LAMBDA_0, so its in-band dynamic range is "
+          "intrinsically the smallest)")
+
+    # ---- 2. identifiability (sensitivity singular values) ------------------
+    n_params = model.n_params
+    if n_params > 0:
+        print(f"\n--- Identifiability: singular values of d log shape / d "
+              f"theta ({n_points} x {n_params}) ---")
+        jac = jax.vmap(
+            jax.jacfwd(lambda th: jnp.log(model(lambdas, th)))
+        )(theta_j)
+        jac = np.asarray(jac).reshape(-1, n_params)
+        sv = np.linalg.svd(jac, compute_uv=False)
+        rank = int(np.sum(sv > sv[0] * 1e-6))
+        print("  " + np.array2string(sv, precision=4, suppress_small=False))
+        print(f"  numerical rank (1e-6 threshold): {rank} / {n_params}"
+              + (f",  condition number {sv[0]/sv[-1]:.3g}" if sv[-1] > 0 else ""))
+        if rank < n_params:
+            print("  ⚠ DEGENERATE: some shape-parameter directions do not "
+                  "change the spectrum at all, so they cannot be recovered "
+                  "from these bands no matter how long the fit runs.")
+
+    # ---- 3. plot + implied counts -----------------------------------------
+    fig, ax = plt.subplots(figsize=(9, 5.5))
+    for th, curve in zip(theta, shapes):
+        ax.plot(lam_np, curve, color="C0", alpha=0.35, lw=1.0)
+    for band in sorted(_BANDS):
+        lo, hi, _r, _name = _BANDS[band]
+        ax.axvline(lo, color="gray", lw=0.5, alpha=0.4)
+        ax.text(0.5 * (lo + hi), 0.99, f"{band}",
+                transform=ax.get_xaxis_transform(),
+                ha="center", va="top", fontsize=7, color="gray")
+    ax.axvline(_BANDS[max(_BANDS)][1], color="gray", lw=0.5, alpha=0.4)
+    ax.axvline(LAMBDA_0, color="k", lw=0.7, alpha=0.4, ls=":")
+    ax.axhline(1.0, color="k", lw=0.5, ls="--", alpha=0.5)
+    ax.set_yscale("log")
+    ax.set_xlim(lam_np.min(), lam_np.max())
+    ax.set_xlabel("Wavelength [um]")
+    ax.set_ylabel("Shape  (normalised to 1 at LAMBDA_0)")
+    ax.set_title(f"{_spectrum_model_name(model)}: shape(lambda; theta) for "
+                 f"{n_samples} draws from the prior")
+    fig.tight_layout()
+    os.makedirs(PLOTS_DIR, exist_ok=True)
+    fig.savefig(fname, dpi=150)
+    plt.close(fig)
+    print(f"\nSaved {fname}")
+
+    _report_photon_counts(model)
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--benchmark", action="store_true",
@@ -1200,11 +1798,42 @@ if __name__ == "__main__":
     parser.add_argument("--lm", action="store_true",
                        help="Use Levenberg-Marquardt (optimistix) instead "
                             "of SGD for the inference step.")
+    parser.add_argument("--spectrum", choices=("blackbody", "nn"),
+                       default=SPECTRUM_KIND,
+                       help="Spectral shape template to simulate with "
+                            "(default: %(default)s).  The model's weights are "
+                            "frozen; only the source parameters are inferred.")
+    parser.add_argument("--nn-seed", type=int, default=NN_SEED,
+                       help="Seed for the neural network weights "
+                            "(default: %(default)s).")
+    parser.add_argument("--nn-hidden", type=int, default=NN_HIDDEN_SIZE,
+                       help="Hidden-layer width of the neural network "
+                            "(default: %(default)s).")
+    parser.add_argument("--nn-layers", type=int, default=NN_N_HIDDEN_LAYERS,
+                       help="Number of hidden layers of the neural network "
+                            "(default: %(default)s).")
+    parser.add_argument("--nn-params", type=int, default=NN_N_PARAMS,
+                       help="Number of shape parameters theta (neural "
+                            "network only; default: %(default)s).")
+    parser.add_argument("--nn-shape-check", action="store_true",
+                       help="Print/plot the spectrum-model shape and "
+                            "identifiability diagnostic, then exit.")
     args = parser.parse_args()
 
-    if args.benchmark:
-        run_benchmark()
+    spectrum_model = _build_spectrum_model(
+        kind=args.spectrum,
+        n_params=args.nn_params,
+        n_hidden_layers=args.nn_layers,
+        hidden_size=args.nn_hidden,
+        seed=args.nn_seed,
+    )
+    _set_spectrum_model(spectrum_model)
+
+    if args.nn_shape_check:
+        nn_shape_check(spectrum_model)
+    elif args.benchmark:
+        run_benchmark(spectrum_model=spectrum_model)
     elif args.compare_n_lambda:
-        compare_n_lambda()
+        compare_n_lambda(spectrum_model=spectrum_model)
     else:
-        end_to_end_mock(use_lm=args.lm)
+        end_to_end_mock(use_lm=args.lm, spectrum_model=spectrum_model)

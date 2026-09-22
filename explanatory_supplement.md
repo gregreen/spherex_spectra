@@ -169,8 +169,10 @@ Both accept the same `__call__` signature: `(source_positions, source_params, im
 ### 3.6 Pre-configured generators (`spherex/config.py`)
 
 - `SpherexImageGenerator` and `SpherexImageGenerator3` pre-configure an `ImageGenerator`/`ImageGenerator3` for a specific SPHEREx band (1–6)
-- Constructor accepts `band`, `psf_scale`, `lambda_slope_scale`, and detector geometry
-- `_build_band(band, psf_scale, lambda_slope_scale)` creates the PSF, transmission, and spectrum model from the band table in `_BANDS`
+- Constructor accepts `band`, `psf_scale`, `lambda_slope_scale`, `spectrum_model`, and detector geometry
+- `_build_band(band, psf_scale, lambda_slope_scale, spectrum_model=None)` creates the PSF, transmission, and spectrum model from the band table in `_BANDS`
+- **`spectrum_model=None`** (the default) builds a fresh `BlackbodySpectrum`, so every pre-existing caller behaves exactly as before. Pass an explicit instance to substitute a different shape template (e.g. `NeuralNetSpectrum`). This is the *only* library change needed to swap the spectrum model — the generators, PSF, transmission and the whole amplitude-solve / inference stack are model-agnostic.
+- **Pass the SAME instance to every band.** A stateful model (a neural network) would otherwise give each band a *different* spectrum, since each band builds its own generator. Stateless models are immune, but sharing one instance is correct in both cases.
 - Bands: 1 (0.75–1.11 µm), 2 (1.11–1.63), 3 (1.63–2.41), 4 (2.41–3.55), 5 (3.55–4.88), 6 (4.88–5.19)
 - `lambda_slope_scale` compensates the wavelength gradient when the detector is downsampled (set to `DOWNSAMPLE` in mock scripts)
 
@@ -286,36 +288,42 @@ Key globals at the top of the file:
 
 | Parameter | Default | Meaning |
 |---|---|---|
-| `DOWNSAMPLE` | 4 | Detector binning factor (2048 → 512 pixels) |
+| `DOWNSAMPLE` | 16 | Detector binning factor (2048 → 128 pixels) |
 | `PSF_SCALE` | 1.0 | Multiplier on PSF FWHM |
-| `N_SOURCES` | 1024 | Number of catalog sources |
+| `N_SOURCES` | 128 | Number of catalog sources |
 | `N_EXPOSURES` | 32 | Number of random detector pointings |
 | `N_LAMBDA` | 1 | Wavelength integration samples (quantile-based) |
 | `HALF_STAMP_FLOOR` | 3 | Minimum postage stamp radius (pixels) |
 | `BACKGROUND_FACTOR` | 2.0 | Background = FACTOR × peak rate of faintest star |
+| `SPECTRUM_KIND` | `"blackbody"` | Shape template: `"blackbody"` or `"nn"` (§6.4) |
+| `NN_N_PARAMS` | 1 | Number of shape parameters θ of the neural network |
+| `NN_N_HIDDEN_LAYERS` | 3 | Hidden layers of the neural network |
+| `NN_HIDDEN_SIZE` | 32 | Neurons per hidden layer |
+| `NN_SEED` | 0 | Seed for the (frozen) random weights |
+| `NN_TARGET_LOG_SHAPE_STD` | 0.5 | Target spread of the rescaled in-band log-shape |
 
 ### 6.2 Pipeline steps
 
-1. **Amplitude range** (`_report_photon_counts`): amplitudes are specified *directly* on the physical $f_\lambda(\lambda_0)$ scale via the `AMPLITUDE_MIN`/`AMPLITUDE_MAX` constants — there is no photon-count *targeting*. The implied detected photon counts are only *reported*, by integrating the blackbody shape over each band (with the Gaussian filter) times `EXPOSURE_TIME`.
+1. **Amplitude range** (`_report_photon_counts`): amplitudes are specified *directly* on the physical $f_\lambda(\lambda_0)$ scale via the `AMPLITUDE_MIN`/`AMPLITUDE_MAX` constants — there is no photon-count *targeting*. The implied detected photon counts are only *reported*, by integrating the active model's shape (at its reference shape parameters — 3000 K for the blackbody, θ = 0 for the network) over each band with the Gaussian filter, times `EXPOSURE_TIME`. The same reference shape sets the background level (`_compute_background`), so both diagnostics track the active model automatically.
 
-2. **Generate catalog** (`_generate_catalog`): sources uniformly distributed on the sphere within a spherical cap, with log-uniform temperatures in [3000, 8000] K and power-law amplitudes P(A) ∝ A^{-1.5}.
+2. **Generate catalog** (`_generate_catalog`): sources uniformly distributed on the sphere within a spherical cap, with shape parameters drawn from the **active model's prior** (log of U(3000, 8000) K for the blackbody, θ ~ N(0, 1) for the network) and power-law amplitudes P(A) ∝ A^{-1.5}.
 
 3. **Generate exposures** (`_generate_exposures`): random detector pointings with random bands (1–6). Computes `half_stamp = max(ceil(5×FWHM/pixel_scale), HALF_STAMP_FLOOR)`.
 
-4. **Filter sources** (`_filter_sources`): for each exposure, select sources within `half_stamp` of the detector edges. Builds per-exposure `(positions_pix, params, band, wcs, half_stamp, src_idx)` tuples where `src_idx` maps into the **full** (unfiltered) catalog.
+4. **Filter sources** (`_filter_sources`): for each exposure, select sources within `half_stamp` of the detector edges. Builds per-exposure `(positions_pix, params, band, wcs, half_stamp, src_idx)` tuples where `params` has shape `(n_in, 1 + P)` — amplitude first, then the `P` shape parameters — and `src_idx` maps into the **full** (unfiltered) catalog.
 
 5. **Generate images** (`_generate_and_save`):
-   - Creates band-generator instances with `lambda_slope_scale=DOWNSAMPLE`
+   - Creates band-generator instances with `lambda_slope_scale=DOWNSAMPLE` and the SAME `spectrum_model` instance for every band
    - Generates noiseless rate images via `gen(positions, params, ...)`
    - Adds background (constant per band) and multiplies by `EXPOSURE_TIME` to get counts
    - Adds Gaussian noise: `σ = sqrt(true_counts + noise_floor²)` with `noise_floor = 1.0`
    - Saves true/noisy/predicted/residual PNGs
 
-6. **Inference** (see §5)
+6. **Inference** (see §5). The initial guess uses a **model-specific draw that deliberately differs from the prior**: amplitudes uniform in `[AMPLITUDE_MIN, AMPLITUDE_MAX]`, blackbody shape parameters uniform in log T, network parameters `N(0, NN_INIT_STD²)`.
 
-7. **Diagnostic plots**: loss history (asinh y-scale), true-vs-recovered scatter, predicted/residual images
+7. **Diagnostic plots**: loss history (asinh y-scale), true-vs-recovered scatter, predicted/residual images, and — for a flexible model — a true-vs-recovered *spectrum* overlay (`plots/spectra_comparison.svg`, see §6.4).
 
-   The true-vs-recovered scatter (`plots/comparison.svg`) highlights "bright" sources, defined as those **detected at S/N > `SNR_THRESHOLD` (5) in at least `MIN_BANDS` (3) distinct SPHEREx bands** — bands, not exposures, so that a source repeatedly observed in one band (which constrains only one point of its spectrum) is not promoted. The per-(source, exposure) S/N is the expected matched-filter significance of the source's own noiseless model counts,
+   The true-vs-recovered scatter (`plots/comparison.svg`) has **one panel per parameter** (`1 + P` panels, caller-supplied labels; with the blackbody's `P = 1` this is the familiar log A / log T pair). It highlights "bright" sources, defined as those **detected at S/N > `SNR_THRESHOLD` (5) in at least `MIN_BANDS` (3) distinct SPHEREx bands** — bands, not exposures, so that a source repeatedly observed in one band (which constrains only one point of its spectrum) is not promoted. The per-(source, exposure) S/N is the expected matched-filter significance of the source's own noiseless model counts,
 
    $$\text{S/N} = \sqrt{\sum_i \frac{(m_i\, t_\text{exp})^2}{\sigma_i^2}}$$
 
@@ -324,6 +332,37 @@ Key globals at the top of the file:
 ### 6.3 Wavelength gradient scaling with downsampling
 
 When `DOWNSAMPLE > 1`, the detector has fewer pixels covering the same physical area. The WCS pixel scale remains 6.2"/pixel, so the physical detector extent shrinks to `(2048/DOWNSAMPLE) × 6.2"`. Without correction, the wavelength range across the detector is compressed by `DOWNSAMPLE`. The fix: `lambda_slope_scale = DOWNSAMPLE` in the generator constructor, which multiplies the µm/arcsec slope so the wavelength range across the (smaller) detector matches the full band.
+
+### 6.4 Optional neural-network spectrum model (`--spectrum nn`)
+
+The mock can be run with a **frozen random `NeuralNetSpectrum`** instead of the analytic blackbody, to test that the pipeline recovers spectra whichever shape template generated them:
+
+```bash
+python scripts/mock_spherex_images.py                          # blackbody (default)
+python scripts/mock_spherex_images.py --spectrum nn            # frozen random net
+python scripts/mock_spherex_images.py --spectrum nn --nn-shape-check
+```
+
+**Why so little changed.** `_build_band` gained one optional `spectrum_model` argument (§3.6), the mock builds **one** model instance and passes it to every band's generator, and everything else was already generic:
+
+* `image.py` / `image3.py` / `psf.py` / `transmission.py` never look at the model beyond calling `spectrum_model(λ, shape_params)`.
+* The amplitude solve is untouched — it only needs the model to be *linear in amplitude* and the shape to be *independent of it*, both of which `NeuralNetSpectrum` guarantees.
+* SGD/LM are untouched: they differentiate only `(log_params, log_backgrounds)`.
+* Parameter bookkeeping is written for `(N, 1 + P)` throughout, so `--nn-params 3` works with no further changes.
+
+**The weights are frozen by construction.** The model is never handed to an optimiser, and the generator is a closed-over constant rather than a JIT argument — that is the *only* way the weights could become traced/differentiated values. `end_to_end_mock` hashes every leaf of the model before and after inference and reports `Spectrum model weights unchanged (frozen)`, and `tests/test_mock_spectrum_model.py` asserts the same thing so a future refactor cannot silently unfreeze it.
+
+**Why the output layer is rescaled.** A randomly initialised MLP produces an arbitrary spectrum: measured over the full 0.75–5 µm range, the raw network's log-shape spread is ~1/100 of the blackbody's, so left alone the frozen net would give near-featureless, decades-wide (or decades-narrow) spectra and the directly specified `AMPLITUDE_MIN`/`AMPLITUDE_MAX` range, the background level and the resulting detection S/N would no longer correspond to the blackbody run. `_rescale_nn_output` therefore scales the final layer's weight block so the λ₀-normalised log-shape has standard deviation `NN_TARGET_LOG_SHAPE_STD = 0.5`. This is *exact* rather than iterative: the shape is `exp(raw(λ,θ) − raw(λ₀,θ))`, which is linear in the final weight block (the final **bias cancels** in the difference), so scaling that block by `f` scales the log-shape by exactly `f`. In practice the factor is ~10².
+
+**`--nn-shape-check` (run this first).** A flexible model can fail *before* any fitting happens — either because θ does not move the in-band shape (θ is then unidentifiable however long you fit) or because the frozen net's spectra span too many decades to be comparable to the blackbody run. The check answers both:
+
+* per-band log-shape range over draws from the prior, e.g. (seed 0) band 1 `[-0.02, +0.06]`, band 6 `[-1.37, -1.20]`;
+* the singular values of $\partial \log \text{shape} / \partial \theta$ on the sampled wavelength grid: near-zero singular values are directions that leave the spectrum unchanged. Seed 0 gives `[46.0]` for `P = 1` (rank 1, condition number 1) and `[31.8, 8.1, 5.2]` for `P = 3` (rank 3, condition number 6.1), so θ is well constrained by the band coverage at both settings — but at `P = 3` the parameters are near the information limit of six bands, so treat large `P` as a test of the plumbing rather than as a physically meaningful model;
+* `shape(λ; θ)` for 64 prior draws, plus the implied photon counts.
+
+**Reading the results.** Since a random net's θ has no physical meaning, `plots/comparison.svg` (θ vs θ) is only a parameter-recovery check; the interpretable diagnostic is `plots/spectra_comparison.svg`, which overlays the true and recovered *spectra* for the brightest sources and reports the median $|\Delta \log \text{shape}|$ over them. In the small-scale smoke runs (`N_SOURCES = 12`, 4 exposures, 64 SGD steps), both models reach $\chi^2/\text{pixel} = 0.993$ at the *true* parameters and 0.994–0.996 at the recovered ones, with a median $|\Delta \log \text{shape}|$ of ~0.12–0.31 dex for the few bright sources.
+
+**Cost.** A 3×32 MLP costs much more arithmetic per wavelength sample than the closed-form Planck function, and the shape is evaluated at every sample of every sub-pixel of every source. Measured on an identical problem (8 sources, band 3, `half_stamp = 10`, `n_lambda = 1`, oversampling 2), the forward model takes 215 ms with the blackbody and 263 ms with the network — only +22%, because the PSF evaluation, sub-pixel bookkeeping and scatter-add dominate the per-pixel work rather than the spectrum evaluation. End to end at the small scale above (12 sources, 4 exposures), 64 SGD steps took 12.0 s versus 16.0 s. Expect the gap to widen with `hidden_size` and `n_lambda`.
 
 ---
 
@@ -405,6 +444,22 @@ The spectrum-model interface is *one source × many wavelengths*: `spherex.image
 
 ---
 
+### 7.18 "Frozen" is a property of the call graph, not of the object
+
+An optimiser can only move what it is handed, so the neural network's weights are frozen for a purely structural reason: `infer_parameters` receives `(log_params, log_backgrounds)`, while the generator — and hence the model — is a closed-over Python constant inside the loss. The failure mode to avoid is accidental widening of that graph. Anything that turns the generator into a *dynamic* JIT argument (re-jitting the loss with the generator as a traced argument rather than a static/closed-over one, or splicing the model's arrays into the parameter pytree) converts its weights into tracers that the optimiser's update is free to alter, and "frozen" silently stops being true — with no error, just slowly drifting spectra.
+
+Cheap guard: fingerprint every leaf of the model before and after the fit and compare. `_model_fingerprint` hashes dtype, shape and bytes of each leaf, so it is sensitive to a single changed value; `end_to_end_mock` prints the verdict and `tests/test_mock_spectrum_model.py` asserts it. Both a spectrum *prior* and the *initial guess* also need to be model-specific — the blackbody draws `log T = log U(3000, 8000 K)` but initialises uniformly in `log T`, while the network draws and initialises `N(0, σ²)`.
+
+### 7.19 Random initialisation needs an explicit output scale — and an identifiability check
+
+A randomly initialised MLP has an arbitrary spectrum. Measured here, the raw 3×32 network's λ₀-normalised log-shape varied ~100× less across 0.75–5 µm than the blackbody's over its temperature prior, so it would have produced a nearly featureless, near power-law spectrum, and the directly specified amplitude range, the background level and the resulting detection S/N would no longer have been comparable to the blackbody run they were chosen for. Fix: rescale the final layer's **weight block** so the in-band log-shape has the intended spread (`NN_TARGET_LOG_SHAPE_STD = 0.5`). This is exact, not iterative, because the shape is `exp(raw(λ,θ) − raw(λ₀,θ))` — linear in that block, with the final **bias cancelling** in the difference — so scaling the block by `f` scales the log-shape by exactly `f`.
+
+Second, a flexible model can be unfittable regardless of the optimiser: if a direction in θ leaves the in-band shape unchanged, that parameter is unidentifiable *in principle*, and a poor recovery is not evidence of a convergence problem. Check it before fitting by looking at the singular values of $\partial \log \text{shape}/\partial\theta$ over the observed wavelengths (unit-independent, because the log-shape is dimensionless): near-zero singular values are the null directions. Practically, a parameter count approaching the number of distinct bands should be treated as a plumbing test, not a physical model.
+
+Also worth remembering when *interpreting* the fit: with a random network, θ has no physical meaning, so the θ-vs-θ scatter is only a parameter-recovery plot; the scientifically meaningful diagnostic is whether the recovered *spectrum* matches the true one (`plot_spectra_comparison`), and its error should be quoted in dex of log-shape rather than as a parameter offset.
+
+---
+
 ## 8. File Map
 
 | File | Purpose |
@@ -415,10 +470,11 @@ The spectrum-model interface is *one source × many wavelengths*: `spherex.image
 | `spherex/transmission.py` | `GaussianFilterTransmission` — LVF transmission with quantile interface |
 | `spherex/image.py` | `_one_subpixel_rate` (quantile integration; splits amplitude out of `source_params`), `ImageGenerator` (scan-based) |
 | `spherex/image3.py` | `ImageGenerator3` (chunked-batch, uses `_one_subpixel_rate` from `image.py`), plus `source_stamps` for the amplitude-solve preconditioner |
-| `spherex/config.py` | `SpherexImageGenerator`, `SpherexImageGenerator3` — pre-configured per-band generators, `_build_band`, band table |
+| `spherex/config.py` | `SpherexImageGenerator`, `SpherexImageGenerator3` — pre-configured per-band generators, `_build_band(..., spectrum_model=None)` (the spectrum-model injection point), band table |
 | `spherex/__init__.py` | Public API exports |
-| `scripts/inference.py` | `infer_parameters` (SGD, with amplitude interlace), `infer_parameters_lm` (LM), `solve_log_amplitudes` (direct amplitude least-squares), `compute_loss`, `compute_lm_loss`, `plot_loss_history`, `plot_comparison`, residual functions, custom LM solver |
-| `scripts/mock_spherex_images.py` | End-to-end mock: catalog, exposures, image generation, hybrid SGD+LM inference, diagnostics, benchmarks |
+| `scripts/inference.py` | `infer_parameters` (SGD, with amplitude interlace), `infer_parameters_lm` (LM), `solve_log_amplitudes` (direct amplitude least-squares), `compute_loss`, `compute_lm_loss`, `plot_loss_history`, `plot_comparison` (one panel per parameter, `1 + P`), residual functions, custom LM solver |
+| `scripts/mock_spherex_images.py` | End-to-end mock: spectrum-model factory + shape-parameter bookkeeping (Step 0), catalog, exposures, image generation, hybrid SGD+LM inference, diagnostics (`--spectrum {blackbody,nn}`, `--nn-shape-check`), benchmarks |
 | `tests/test_image3.py` | Numerical tests verifying ImageGenerator3 ≡ ImageGenerator |
+| `tests/test_mock_spectrum_model.py` | Model factory (determinism, output rescaling), generic `(N, 1 + P)` bookkeeping, generator injection, and the frozen-weights guarantee |
 | `pyproject.toml` | Dependencies: `jax`, `equinox`, `optimistix`, `lineax`, `numpy` |
 | `/memories/jax_optimization_lessons.md` | Persistent notes on LM trust-region tuning and memory safety |
