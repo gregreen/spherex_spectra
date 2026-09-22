@@ -21,6 +21,7 @@ import jax.numpy as jnp
 
 from .constants import HC_JAX
 from .image import _one_subpixel_rate
+from .spectrum import normalized_source_params
 
 
 class ImageGenerator3(eqx.Module):
@@ -96,6 +97,11 @@ class ImageGenerator3(eqx.Module):
         # ---- per-source stamp computation (no image carry) -----------------
         def _one_stamp(src):
             pixel_xy, params_s = src          # (2,) in pixel coordinates
+
+            # Fold the LAMBDA_0 normalisation into the amplitude ONCE for this
+            # source, so the per-sub-pixel kernel below needs a single exp and
+            # the spectrum model stays anchor-free (see ``spherex.spectrum``).
+            params_s = normalized_source_params(self.spectrum_model, params_s)
 
             jc = jnp.floor(pixel_xy[0]).astype(jnp.int32)
             ic = jnp.floor(pixel_xy[1]).astype(jnp.int32)

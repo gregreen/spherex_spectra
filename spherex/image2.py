@@ -16,6 +16,13 @@
     quantile sampling (each sub-pixel has a different ``omega_p``, hence
     a different quantile location).
 
+    It also predates two later conventions and was NOT updated for them:
+    the amplitude-first ``source_params`` layout (it never applies
+    ``exp(source_params[..., 0])`` at all) and the log-flux spectrum-model
+    contract of ``spherex.spectrum`` (it treats the model's output as a
+    linear flux).  Its output amplitudes are therefore WRONG; use
+    ``ImageGenerator`` or ``ImageGenerator3``.
+
 Same interface as ``spherex.image`` but with two algorithmic improvements
 that preserve mathematical correctness:
 

@@ -27,6 +27,8 @@ from spherex import (  # noqa: E402
     SpherexImageGenerator,
     SpherexImageGenerator3,
     LAMBDA_0,
+    normalized_shape,
+    normalized_log_shape,
 )
 from spherex.config import _build_band  # noqa: E402
 
@@ -46,10 +48,16 @@ def _small_nn(n_params=1, n_hidden_layers=1, hidden_size=8, seed=0):
 # Model factory
 # ---------------------------------------------------------------------------
 
-def test_build_spectrum_model_blackbody_by_default():
-    model = mock._build_spectrum_model(verbose=False)
+def test_build_spectrum_model_kinds():
+    """The factory honours the requested kind, and defaults to SPECTRUM_KIND."""
+    model = mock._build_spectrum_model(kind="blackbody", verbose=False)
     assert isinstance(model, BlackbodySpectrum)
     assert model.n_params == 1
+
+    default = mock._build_spectrum_model(verbose=False)
+    expected = (BlackbodySpectrum if mock.SPECTRUM_KIND == "blackbody"
+                else NeuralNetSpectrum)
+    assert isinstance(default, expected)
 
 
 def test_build_spectrum_model_rejects_unknown_kind():
@@ -79,7 +87,7 @@ def test_nn_rescale_hits_target_log_shape_std():
     thetas = jax.random.normal(jax.random.PRNGKey(1234), (256, model.n_params))
 
     log_shape = jax.vmap(
-        lambda th: jnp.log(model(lambdas, th))
+        lambda th: normalized_log_shape(model, lambdas, th)
     )(thetas)
     measured = float(jnp.std(log_shape))
 
@@ -88,17 +96,22 @@ def test_nn_rescale_hits_target_log_shape_std():
 
 
 def test_nn_shape_is_normalised_and_positive():
+    """Caller-normalised NN shapes are finite, positive and 1 at LAMBDA_0."""
     model = _small_nn(seed=5)
     thetas = jax.random.normal(jax.random.PRNGKey(0), (8, model.n_params))
     lambdas = mock._wavelength_grid(64)
 
-    shapes = jax.vmap(lambda th: model(lambdas, th))(thetas)
+    log_shapes = jax.vmap(
+        lambda th: normalized_log_shape(model, lambdas, th)
+    )(thetas)
+    assert np.all(np.isfinite(log_shapes))
 
-    assert np.all(np.isfinite(shapes))
-    assert np.all(np.asarray(shapes) > 0.0)
+    shapes = np.asarray(jnp.exp(log_shapes))
+    assert np.all(shapes > 0.0)
     # Normalised to exactly 1 at the global reference wavelength.
     np.testing.assert_allclose(
-        np.asarray(model(jnp.array([LAMBDA_0]), thetas[0])), 1.0, rtol=1e-5
+        np.asarray(normalized_shape(model, jnp.array([LAMBDA_0]), thetas[0])),
+        1.0, rtol=1e-5,
     )
 
 
@@ -228,12 +241,57 @@ def test_generators_accept_injected_spectrum_model(cls):
     assert not np.allclose(img_nn, img_bb)
 
 
-def test_build_band_default_is_unchanged():
-    """The default path must still build a blackbody, bit for bit."""
+def test_build_band_default_builds_a_blackbody():
+    """The library default path still builds an (anchor-free) blackbody."""
     _psf, _tr, spectrum_model, _ap = _build_band(3)
     assert isinstance(spectrum_model, BlackbodySpectrum)
     assert spectrum_model.n_params == 1
-    assert spectrum_model.lambda_0 == LAMBDA_0
+
+
+class _OffsetSpectrum(eqx.Module):
+    """A spectrum model plus a wavelength-independent offset.
+
+    Models are only defined up to such an offset - a randomly initialised
+    network supplies an arbitrary one - so the generators must be blind to it.
+    """
+
+    base: eqx.Module
+    offset: float
+
+    def __call__(self, wavelength, shape_params):
+        return self.base(wavelength, shape_params) + self.offset
+
+
+@pytest.mark.parametrize("cls", [SpherexImageGenerator,
+                                 SpherexImageGenerator3])
+def test_images_are_invariant_to_a_model_offset(cls):
+    """Two models differing only by an offset must give the same image.
+
+    This is the end-to-end guarantee of moving the LAMBDA_0 normalisation out
+    of the models and into the generators.  (Agreement is limited to a few
+    parts in 10^6 by float32 cancellation in ``(a + c) - (b + c)``, so this is
+    not bit-exact.)
+    """
+    positions = jnp.asarray([[16.0, 16.0], [25.0, 13.0]], dtype=jnp.float32)
+    params = jnp.asarray([[np.log(1e-17), np.log(5.0)],
+                          [np.log(3e-18), np.log(4.0)]], dtype=jnp.float32)
+    kwargs = dict(postage_stamp_half_size=6, n_wavelength_samples=3,
+                  oversampling=2)
+
+    bb = BlackbodySpectrum()
+    gen_plain = cls(band=3, image_width=48, image_height=48,
+                    spectrum_model=bb)
+    gen_shifted = cls(band=3, image_width=48, image_height=48,
+                      spectrum_model=_OffsetSpectrum(bb, 9.0))
+
+    img_plain = np.asarray(gen_plain(positions, params, **kwargs))
+    img_shifted = np.asarray(gen_shifted(positions, params, **kwargs))
+
+    # Sanity: the sources actually put flux on the detector (pixels outside the
+    # postage stamps are legitimately exactly zero, hence the tiny atol).
+    assert img_plain.sum() > 0.0
+    assert np.all(np.isfinite(img_shifted))
+    np.testing.assert_allclose(img_shifted, img_plain, rtol=1e-5, atol=1e-20)
 
 
 # ---------------------------------------------------------------------------

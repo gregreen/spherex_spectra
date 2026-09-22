@@ -28,7 +28,6 @@ def main():
     psf = GaussianPSF(
         fwhm_ref=6.0,          # arcsec  (SPHEREx PSF ~6 arcsec in the optical)
         wavelength_ref=1.0,     # um
-        
     )
 
     transmission = GaussianFilterTransmission(
@@ -120,7 +119,7 @@ def main():
     fig.tight_layout()
     plt.savefig("simple_simulation.png", dpi=150)
     print("Saved simple_simulation.png")
-    plt.show()
+    plt.close(fig)
 
     # ------------------------------------------------------------------
     # 5. Demonstrate gradient computation

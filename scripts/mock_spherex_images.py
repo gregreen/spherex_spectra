@@ -28,7 +28,9 @@ from spherex import (SpherexImageGenerator, SpherexImageGenerator3,
                      BlackbodySpectrum, NeuralNetSpectrum)
 from spherex.config import _BANDS
 from spherex.constants import HC_JAX, TEMPERATURE_UNIT
-from spherex.spectrum import LAMBDA_0, split_source_params
+from spherex.spectrum import (
+    LAMBDA_0, split_source_params, normalized_shape, normalized_log_shape,
+)
 from spherex.plotting_utils import HistEqNormalize
 from jax.scipy.integrate import trapezoid
 import sys
@@ -105,11 +107,12 @@ N_LAMBDA = 1
 # Spectrum model (the source's spectral SHAPE template)
 # ---------------------------------------------------------------------------
 # The mock can run with either analytic blackbodies or a frozen random neural
-# network.  In both cases the model describes only the SHAPE (normalised to
-# f_lambda = 1 at LAMBDA_0); the amplitude stays in the first column of
-# ``source_params`` and is drawn / inferred by the usual machinery.  Nothing
-# downstream of the shape (image generation, PSF, transmissions, the
-# amplitude solve, the optimisers) changes.
+# network.  In both cases the model returns the source's UNNORMALISED
+# LOG-FLUX (see ``spherex.spectrum``) and describes only the SHAPE: the
+# generators anchor it at LAMBDA_0, so the amplitude stays in the first column
+# of ``source_params`` (as log f_lambda(LAMBDA_0)) and is drawn / inferred by
+# the usual machinery.  Nothing downstream of the shape (image generation,
+# PSF, transmissions, the amplitude solve, the optimisers) changes.
 #
 # "blackbody" : analytic BlackbodySpectrum, 1 shape parameter (log T).
 # "nn"        : NeuralNetSpectrum with FROZEN random weights; the number of
@@ -118,12 +121,24 @@ SPECTRUM_KIND = "nn"
 
 # Neural-network hyperparameters (only used if SPECTRUM_KIND = "nn")
 NN_N_PARAMS = 1
-NN_N_HIDDEN_LAYERS = 2
-NN_HIDDEN_SIZE = 16
+NN_N_HIDDEN_LAYERS = 1
+NN_HIDDEN_SIZE = 32
 NN_SEED = 314159
 
+# Fourier (positional) embedding of the wavelength: the input vector carries
+# ln(wavelength) plus sin/cos of NN_N_EMBEDDINGS geometrically spaced
+# frequencies covering NN_DELTA_LN_WAVELENGTH e-foldings of wavelength.  Log
+# space keeps the embedding scale-invariant, matching the instrument: a
+# bandpass has a constant *fractional* width, so one setting gives every band
+# the same relative resolution.  More embeddings let the shape bend on finer
+# scales - but note that the image generators integrate each pixel's bandpass
+# with as few as N_LAMBDA samples, which is only valid while the shape varies
+# slowly across the filter (see ``NeuralNetSpectrum``'s quadrature caution).
+NN_N_EMBEDDINGS = 8
+NN_DELTA_LN_WAVELENGTH = np.log(5.0 / 0.75)   # full 0.75 - 5.0 um range
+
 # The randomly initialised network is rescaled so that its in-band
-# lambda_0-normalised log-shape has roughly this standard deviation over the
+# LAMBDA_0-normalised log-shape has roughly this standard deviation over the
 # prior, i.e. |log shape| ~ 1-2 out to 2-4 sigma.  Without this the frozen
 # random net could produce spectra spanning many decades, which would move the
 # amplitude range / background / detection S/N regime away from the blackbody
@@ -172,24 +187,33 @@ def _is_blackbody(model):
     return isinstance(model, BlackbodySpectrum)
 
 
-def _wavelength_grid(n_points=256):
-    """Wavelength grid (um) spanning every SPHEREx band."""
+def _wavelength_grid(n_points=512):
+    """Wavelength grid (um) spanning every SPHEREx band, LOG-spaced.
+
+    The neural network embeds the wavelength in log space, so its finest
+    Fourier features have a constant width in ``ln(lambda)`` - a linear grid
+    would under-sample them at the short-wavelength end (and over-sample the
+    long-wavelength end).  A log-spaced grid gives every feature the same
+    number of samples, and is what the shape diagnostics and the output
+    rescaling should measure.
+    """
     lam_min = min(lo for lo, _hi, _r, _name in _BANDS.values())
     lam_max = max(hi for _lo, hi, _r, _name in _BANDS.values())
-    return jnp.linspace(lam_min, lam_max, n_points)
+    return jnp.logspace(jnp.log10(lam_min), jnp.log10(lam_max), n_points)
 
 
 def _rescale_nn_output(model, key, target_std=NN_TARGET_LOG_SHAPE_STD,
                        n_samples=NN_RESCALE_SAMPLES):
     """Rescale a :class:`NeuralNetSpectrum` output layer to an O(1) log-shape.
 
-    ``NeuralNetSpectrum`` returns
-    ``exp(raw(lambda, theta) - raw(LAMBDA_0, theta))``, which is *exactly
-    linear* in the final layer's weight block: the final bias cancels in the
-    difference, so scaling that block by ``factor`` scales the log-shape by
-    exactly ``factor``.  One measurement therefore suffices - draw theta from
-    the prior, measure the log-shape's spread over the full wavelength range,
-    and scale the weight block to hit ``target_std``.
+    The dimensionless shape is
+    ``exp(model(lambda, theta) - model(LAMBDA_0, theta))`` (see
+    ``spherex.spectrum``), which is *exactly linear* in the final layer's
+    weight block: the final bias cancels in the difference, so scaling that
+    block by ``factor`` scales the log-shape by exactly ``factor``.  One
+    measurement therefore suffices - draw theta from the prior, measure the
+    log-shape's spread over the full wavelength range, and scale the weight
+    block to hit ``target_std``.
 
     This keeps a *randomly initialised* network in the same dynamic range as
     the blackbody it replaces, so the directly-specified amplitude range, the
@@ -202,13 +226,11 @@ def _rescale_nn_output(model, key, target_std=NN_TARGET_LOG_SHAPE_STD,
     lambdas = _wavelength_grid()
     thetas = jax.random.normal(key, (n_samples, model.n_params))
 
-    def _log_shape(theta):
-        ln_flux = jax.vmap(model.raw_neural_net, in_axes=(0, None))(
-            lambdas, theta
-        )
-        return ln_flux - model.raw_neural_net(LAMBDA_0, theta)
-
-    log_shape = jax.vmap(_log_shape)(thetas)          # (n_samples, n_lambda)
+    # The normalised log-shape is exactly the log-flux minus its value at
+    # LAMBDA_0 - the quantity the generators compute per source.
+    log_shape = jax.vmap(
+        lambda theta: normalized_log_shape(model, lambdas, theta)
+    )(thetas)                                         # (n_samples, n_lambda)
     current = float(jnp.std(log_shape))
     if not np.isfinite(current) or current <= 0.0:
         return model, 1.0
@@ -229,6 +251,8 @@ def _build_spectrum_model(
     n_hidden_layers=NN_N_HIDDEN_LAYERS,
     hidden_size=NN_HIDDEN_SIZE,
     seed=NN_SEED,
+    n_embeddings=NN_N_EMBEDDINGS,
+    delta_ln_wavelength=NN_DELTA_LN_WAVELENGTH,
     *,
     target_log_shape_std=NN_TARGET_LOG_SHAPE_STD,
     verbose=True,
@@ -244,6 +268,9 @@ def _build_spectrum_model(
     seed : int
         Seed for the neural network's weight initialisation, and (with a
         derived key) for the output rescaling.
+    n_embeddings, delta_ln_wavelength : int, float
+        Wavelength Fourier-embedding hyperparameters in log-wavelength space
+        (neural-network model only; see ``spherex.spectrum.NeuralNetSpectrum``).
     target_log_shape_std : float
         Target standard deviation of the ``LAMBDA_0``-normalised log-shape.
 
@@ -267,7 +294,9 @@ def _build_spectrum_model(
         )
 
     model = NeuralNetSpectrum(
-        n_params, n_hidden_layers, hidden_size, key=jax.random.PRNGKey(seed)
+        n_params, n_hidden_layers, hidden_size,
+        n_embeddings=n_embeddings, delta_ln_wavelength=delta_ln_wavelength,
+        key=jax.random.PRNGKey(seed),
     )
     model, factor = _rescale_nn_output(
         model, jax.random.PRNGKey(seed + 1), target_log_shape_std
@@ -275,6 +304,7 @@ def _build_spectrum_model(
     if verbose:
         print(f"  Spectrum model: NeuralNetSpectrum(P={n_params}, "
               f"layers={n_hidden_layers}, hidden={hidden_size}, "
+              f"embeddings={n_embeddings}/{delta_ln_wavelength:.3f}ln-lambda, "
               f"seed={seed}), random weights FROZEN")
         print(f"    output layer rescaled by {factor:.4g} to give an in-band "
               f"log-shape std of ~{target_log_shape_std:g}")
@@ -409,7 +439,7 @@ def _total_photons_per_exposure(band, amplitude, model=None):
     sigma_t = lam_mid / (2.0 * jnp.sqrt(2.0 * jnp.log(2.0)) * R)
     T_weight = jnp.exp(-(lambdas - lam_mid) ** 2 / (2.0 * sigma_t ** 2))
 
-    shape = model(lambdas, _reference_shape_params(model))
+    shape = normalized_shape(model, lambdas, _reference_shape_params(model))
     f_lam = amplitude * shape
 
     aperture = jnp.pi * (0.10) ** 2
@@ -641,7 +671,7 @@ def _compute_background(band, model=None):
     # Flux density at band centre: amplitude (f_lambda at LAMBDA_0) times the
     # dimensionless spectrum *shape*.
     lam_arr = jnp.array([lam_mid])
-    shape = model(lam_arr, _reference_shape_params(model))
+    shape = normalized_shape(model, lam_arr, _reference_shape_params(model))
     f_lam = float(AMPLITUDE_MIN * shape[0])       # W / (m^2 um)
 
     # Effective bandwidth of the Gaussian transmission
@@ -977,12 +1007,14 @@ def plot_spectra_comparison(true_params, recovered_params, bright_mask,
     fig, ax = plt.subplots(figsize=(9, 5.5))
     errors = []
     for i in selected:
-        true_s = np.asarray(
-            model(lambdas, jnp.asarray(true_shape[i], jnp.float32))
-        )
-        rec_s = np.asarray(
-            model(lambdas, jnp.asarray(rec_shape[i], jnp.float32))
-        )
+        # Dimensionless shapes (1 at LAMBDA_0) - the model itself returns an
+        # unnormalised log-flux, so ask the helper for the physical shape.
+        true_s = np.asarray(normalized_shape(
+            model, lambdas, jnp.asarray(true_shape[i], jnp.float32)
+        ))
+        rec_s = np.asarray(normalized_shape(
+            model, lambdas, jnp.asarray(rec_shape[i], jnp.float32)
+        ))
         ax.plot(lam_np, true_s, color="C0", alpha=0.5, lw=1.0)
         ax.plot(lam_np, rec_s, color="C3", alpha=0.5, lw=1.0, ls="--")
         good = (np.isfinite(true_s) & np.isfinite(rec_s)
@@ -1719,7 +1751,12 @@ def nn_shape_check(model=None, n_samples=64, n_points=400, seed=NN_SEED + 2,
     theta = _draw_shape_params(rng, n_samples, model)
     theta_j = jnp.asarray(theta, dtype=jnp.float32)
 
-    shapes = np.asarray(jax.vmap(lambda th: model(lambdas, th))(theta_j))
+    # Dimensionless log-shape for every draw: the quantity the generators
+    # exponentiate (see spherex.spectrum.normalized_log_shape).
+    log_shapes = np.asarray(
+        jax.vmap(lambda th: normalized_log_shape(model, lambdas, th))(theta_j)
+    )
+    shapes = np.exp(log_shapes)
 
     # ---- 1. per-band log-shape dynamic range ------------------------------
     print(f"\n--- In-band log-shape range over {n_samples} draws from the "
@@ -1729,7 +1766,7 @@ def nn_shape_check(model=None, n_samples=64, n_points=400, seed=NN_SEED + 2,
         inside = (lam_np >= lo) & (lam_np <= hi)
         if not np.any(inside):
             continue
-        log_shape = np.log(shapes[:, inside])
+        log_shape = log_shapes[:, inside]
         lo_med, hi_med = np.median(log_shape.min(axis=1)), \
             np.median(log_shape.max(axis=1))
         lo_w, hi_w = np.percentile(log_shape.min(axis=1), 5), \
@@ -1746,7 +1783,7 @@ def nn_shape_check(model=None, n_samples=64, n_points=400, seed=NN_SEED + 2,
         print(f"\n--- Identifiability: singular values of d log shape / d "
               f"theta ({n_points} x {n_params}) ---")
         jac = jax.vmap(
-            jax.jacfwd(lambda th: jnp.log(model(lambdas, th)))
+            jax.jacfwd(lambda th: normalized_log_shape(model, lambdas, th))
         )(theta_j)
         jac = np.asarray(jac).reshape(-1, n_params)
         sv = np.linalg.svd(jac, compute_uv=False)
@@ -1815,6 +1852,15 @@ if __name__ == "__main__":
     parser.add_argument("--nn-params", type=int, default=NN_N_PARAMS,
                        help="Number of shape parameters theta (neural "
                             "network only; default: %(default)s).")
+    parser.add_argument("--nn-embeddings", type=int, default=NN_N_EMBEDDINGS,
+                       help="Number of wavelength Fourier features (neural "
+                            "network only; 0 feeds the raw wavelength; "
+                            "default: %(default)s).")
+    parser.add_argument("--nn-delta-ln-wavelength", type=float,
+                       default=NN_DELTA_LN_WAVELENGTH,
+                       help="Span of the log-wavelength Fourier embedding, "
+                            "i.e. the range of ln(lambda) covered "
+                            "(default: %(default)s).")
     parser.add_argument("--nn-shape-check", action="store_true",
                        help="Print/plot the spectrum-model shape and "
                             "identifiability diagnostic, then exit.")
@@ -1826,6 +1872,8 @@ if __name__ == "__main__":
         n_hidden_layers=args.nn_layers,
         hidden_size=args.nn_hidden,
         seed=args.nn_seed,
+        n_embeddings=args.nn_embeddings,
+        delta_ln_wavelength=args.nn_delta_ln_wavelength,
     )
     _set_spectrum_model(spectrum_model)
 

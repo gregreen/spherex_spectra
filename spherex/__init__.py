@@ -7,8 +7,13 @@ from .spectrum import (
     NeuralNetSpectrum,
     LAMBDA_0,
     LOG_AMPLITUDE_INDEX,
+    DEFAULT_DELTA_LN_WAVELENGTH,
     split_source_params,
     join_source_params,
+    reference_log_flux,
+    normalized_log_shape,
+    normalized_shape,
+    normalized_source_params,
 )
 from .psf import GaussianPSF
 from .transmission import GaussianFilterTransmission
@@ -25,8 +30,13 @@ __all__ = [
     "NeuralNetSpectrum",
     "LAMBDA_0",
     "LOG_AMPLITUDE_INDEX",
+    "DEFAULT_DELTA_LN_WAVELENGTH",
     "split_source_params",
     "join_source_params",
+    "reference_log_flux",
+    "normalized_log_shape",
+    "normalized_shape",
+    "normalized_source_params",
     "GaussianPSF",
     "GaussianFilterTransmission",
     "ImageGenerator",

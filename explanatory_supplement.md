@@ -21,7 +21,7 @@ The pipeline is built around three principles:
 
 **Mathematical correctness for precision results.** The pipeline is designed for scientific use where systematic errors at the sub-percent level matter:
 
-- **Quantile-based wavelength integration** (`_one_subpixel_rate` in `spherex/image.py`): instead of a fixed `linspace` + trapezoid rule (which mostly samples the near-zero tails of a narrow bandpass), the code draws wavelength samples at evenly spaced quantiles of the transmission profile's normalised CDF via `transmission.quantile(q, omega_p)`. This concentrates samples where the transmission actually has support. At `N_LAMBDA = 1` the RMS residual against a 63-sample reference is only `2.3e-5` — far more accurate than naive quadrature at the same sample count.
+- **Quantile-based wavelength integration** (`_one_subpixel_rate` in `spherex/image.py`): instead of a fixed `linspace` + trapezoid rule (which mostly samples the near-zero tails of a narrow bandpass), the code draws wavelength samples at evenly spaced quantiles of the transmission profile's normalised CDF via `transmission.quantile(q, omega_p)`. This concentrates samples where the transmission actually has support. At `N_LAMBDA = 1` the RMS residual against a 63-sample reference is only `2.3e-5` — far more accurate than naive quadrature at the same sample count, *provided the spectrum varies slowly across the bandpass*. That proviso is model-dependent: it holds comfortably for the blackbody (~1e-5) and for an unembedded network (~1e-6), but a heavily Fourier-embedded network varies by a factor of ~2 across a single bandpass, which costs ~4e-3 relative RMS (§6.4).
 - **Float32-safe gradients** (`BlackbodySpectrum.__call__` in `spherex/spectrum.py`): the Planck function gradient `d/dT` is reformulated to avoid `(K_B·T)²` underflow at `T ~ 5 kK` in float32. An `inv_T_scale` pre-factor is computed from `HC/(λ·K_B)` so the gradient becomes `-inv_T_scale / T²`, neither factor underflowing.
 - **Loss normalization** (`scripts/inference.py`): the loss is `chi² / n_pixels`, summed over *all* exposures simultaneously divided by the *global* pixel count — not a mean of per-exposure means (which would up-weight small exposures). This makes the loss directly interpretable: ~1 at convergence, ≫1 indicates poor fit, ≪1 indicates overfitting or sigma miscalibration.
 
@@ -49,11 +49,27 @@ A source at position $(x_s, y_s)$ on the sky (denoted $\Omega_s = (x_s, y_s)$ in
 $$f_\lambda(\lambda; T, A) = A \cdot \hat{B}_\lambda(\lambda, T), \qquad
 \hat{B}_\lambda(\lambda, T) = \frac{B_\lambda(\lambda, T)}{B_\lambda(\lambda_0, T)}$$
 
-where $B_\lambda$ is the Planck function and $\lambda_0$ is a single **global** reference wavelength (`LAMBDA_0 = 1.0 µm` in `spherex/spectrum.py`) shared by every band — so the modelled spectrum stays smooth in amplitude across the whole wavelength range. The spectrum model returns only the dimensionless *shape* $\hat{B}_\lambda$, which equals exactly 1 at $\lambda_0$.
+where $B_\lambda$ is the Planck function and $\lambda_0$ is a single **global** reference wavelength (`LAMBDA_0 = 1.0 µm` in `spherex/spectrum.py`) shared by every band — so the modelled spectrum stays smooth in amplitude across the whole wavelength range. The dimensionless shape $\hat{B}_\lambda$ equals exactly 1 at $\lambda_0$.
 
-**Amplitude is not part of the spectrum model.** It is carried as a separate per-source parameter, always the **first** column of `source_params` (`LOG_AMPLITUDE_INDEX = 0`). The image generator applies it as $\exp(\texttt{source\_params}[:, 0])$ and passes only `source_params[:, 1:]` to the spectrum model. Because $A = f_\lambda(\lambda_0)$ is a physical flux density, $\log A$ has a direct interpretation. All parameters are stored in log-space to enforce positivity and improve optimizer conditioning.
+**The models return an unnormalised log-flux, and the CALLERS do the normalising.** A spectrum model returns $\log f_\lambda$ up to an additive constant that is independent of wavelength:
 
-`BlackbodySpectrum` therefore has a single free parameter, $\log(T/\text{kK})$. Crucially, the forward model is **exactly linear in the amplitude** $a = \exp(\log A)$ — a source's contribution is just $a$ times its unit-amplitude postage stamp — which is what makes the direct amplitude least-squares solve of §5.5 possible.
+```
+spectrum_model(wavelength, shape_params) -> log f_lambda + const
+```
+
+and the image generators turn that into the physical spectrum by anchoring it at $\lambda_0$:
+
+$$f_\lambda(\lambda) = \exp\big(\log A + \texttt{model}(\lambda, \theta) - \texttt{model}(\lambda_0, \theta)\big)$$
+
+Nothing about this is specific to a blackbody — a blackbody, a neural network, or any future template differ only in what they return. Three properties make it work:
+
+* **The models are anchor-free.** They know nothing about `LAMBDA_0` and never exponentiate, so a model is a pure (log-)kernel. The normalisation lives in `spherex.spectrum.reference_log_flux` / `normalized_shape` / `normalized_source_params`, and the constant is evaluated **once per source** by the generators, then folded into the amplitude column (`normalized_source_params`) so the per-sub-pixel kernel is a single `exp` and a single add. Doing it any later (inside the model) re-evaluates a wavelength-independent quantity once per sub-pixel — see §7.20.
+* **Log space, not linear.** An unnormalised *linear* kernel would mean exponentiating an arbitrary offset and dividing: the network's raw output has an offset that is independent of wavelength and that the data cannot constrain (it is a null direction of the likelihood), so it can drift during inference and overflow float32. Exponentiating the (bounded) *difference* cannot overflow.
+* **The convention survives.** Because the caller divides by the model's value at $\lambda_0$, $A = f_\lambda(\lambda_0)$ is still a physical flux density and $\log A$ keeps its direct interpretation.
+
+**Amplitude is not part of the spectrum model.** It is carried as a separate per-source parameter, always the **first** column of `source_params` (`LOG_AMPLITUDE_INDEX = 0`); `source_params[:, 1:]` are the shape parameters $\theta$. All parameters are stored in log-space to enforce positivity and improve optimizer conditioning.
+
+`BlackbodySpectrum` therefore has a single free parameter, $\log(T/\text{kK})$. Crucially, the forward model is **exactly linear in the amplitude** $a = \exp(\log A)$ — a source's contribution is just $a$ times its unit-amplitude postage stamp — which is what makes the direct amplitude least-squares solve of §5.5 possible. Note that this linearity is preserved by the normalisation: the folded constant is independent of $a$.
 
 ### 2.2 PSF
 
@@ -123,16 +139,17 @@ All models are `equinox.Module` subclasses in `spherex/`. They store hyperparame
 
 ### 3.1 `BlackbodySpectrum` (`spherex/spectrum.py`)
 
-- **Attributes**: `lambda_0` (reference wavelength, defaulting to the global `LAMBDA_0 = 1.0 µm`), `n_params = 1` (log-T only — the amplitude lives *outside* the model)
-- **`__call__(wavelength, shape_params)`**: returns the dimensionless shape $\hat{B}_\lambda = B_\lambda(\lambda,T)/B_\lambda(\lambda_0,T)$, which is exactly 1 at $\lambda_0$. Physical flux density is $\exp(\log A)\cdot\hat{B}_\lambda$.
-- **Layout helpers**: `LOG_AMPLITUDE_INDEX`, `split_source_params`, `join_source_params` define the `[log_amplitude, shape…]` convention in one place
-- **Implementation detail**: uses `inv_T_scale = HC/(λ·KB)` to avoid float32 underflow in the Planck gradient
+- **Attributes**: `n_params = 1` (log-T only — the amplitude lives *outside* the model). There is no `lambda_0` attribute: the model is anchor-free.
+- **`__call__(wavelength, shape_params)`**: returns the **unnormalised log-flux** $\log B_\lambda$ minus the constant $\log(2hc^2)$, i.e. $-5\log\lambda - \log(e^x - 1)$ with $x = hc/(\lambda k_B T)$. Only *differences* of this quantity are physical, which is exactly what the caller's normalisation at $\lambda_0$ produces: $\hat{B}_\lambda = \exp(\texttt{model}(\lambda,T) - \texttt{model}(\lambda_0,T))$.
+- **Layout / normalisation helpers**: `LOG_AMPLITUDE_INDEX`, `split_source_params`, `join_source_params` define the `[log_amplitude, shape…]` convention; `reference_log_flux`, `normalized_log_shape`, `normalized_shape` and `normalized_source_params` implement the anchoring at `LAMBDA_0` (§2.1).
+- **Implementation detail**: uses `inv_T_scale = HC/(λ·KB)` to avoid float32 underflow in the Planck gradient; the exponent is clipped at 50 so `expm1` cannot overflow.
 
 ### 3.2 `NeuralNetSpectrum` (`spherex/spectrum.py`)
 
-A flexible alternative to the blackbody. A small MLP maps `(wavelength, shape_params)` to a log-flux and the shape is the exponential of the difference between that log-flux and its value at `LAMBDA_0`:
+A flexible alternative to the blackbody. A small MLP maps `(wavelength, shape_params)` to a log-flux, which `__call__` returns directly — the model neither normalises nor exponentiates:
 
-$$\hat{B}_\lambda(\lambda) = \exp\big(\mathrm{NN}(\lambda, \theta) - \mathrm{NN}(\lambda_0, \theta)\big)$$
+$$\texttt{model}(\lambda; \theta) = \mathrm{NN}(\lambda, \theta), \qquad
+\hat{B}_\lambda(\lambda) = \exp\big(\mathrm{NN}(\lambda, \theta) - \mathrm{NN}(\lambda_0, \theta)\big)$$
 
 which is *exactly* 1 at $\lambda_0$ for **any** $\theta$. Keeping the blackbody's normalisation convention is what makes the amplitude (first column of `source_params`) remain $f_\lambda(\lambda_0)$, and it is why **the entire amplitude pipeline works unchanged**: the least-squares solve only requires the model to be linear in amplitude and the shape to be independent of it, both of which hold (verified numerically — the solve recovers amplitudes to ~2×10⁻² in log on a synthetic problem, driving $\chi^2/\text{pixel}$ from ~2×10⁴ to ~1.1).
 
@@ -140,8 +157,14 @@ which is *exactly* 1 at $\lambda_0$ for **any** $\theta$. Keeping the blackbody'
 - **`__init__(n_params, n_hidden_layers, hidden_size, *, key)`**: `key` is **required** (`eqx.nn.Linear` needs a PRNG key); one key per layer is derived with `jax.random.split`. All fields are declared as annotations, which is mandatory for `equinox.Module` (pytree) behaviour.
 - **Batching contract** (identical to `BlackbodySpectrum`): `__call__(wavelength (N_λ,), shape_params (P,)) -> (N_λ,)`, i.e. **one source, many wavelengths**. The image generators already supply the other axes — `jax.vmap` over sub-pixels and `lax.scan`/`lax.map` over sources — and call `spectrum_model(lambdas, shape_params)` once per source per sub-pixel, so the model must not try to batch them itself.
 - **Internals**: the MLP is evaluated one wavelength at a time and vectorised with `jax.vmap`. An MLP layer expects the feature axis last, so `concatenate([λ, θ])` is only well defined for a *scalar* λ (a wavelength *vector* would be read as extra features). To batch over sources as well, compose a second vmap at the call site: `jax.vmap(model, in_axes=(None, 0))(wavelengths, shape_params_batch)`.
-- **Cost caution**: the shape is evaluated at every wavelength sample of every sub-pixel of every source, and an MLP costs orders of magnitude more per point than the closed-form blackbody — this slows the forward model *and* each interleaved amplitude solve (which rebuilds the postage stamps). Keep `hidden_size` modest. Each call also evaluates the network once at `LAMBDA_0` to normalise, so with `n_wavelength_samples = 1` the MLP runs twice per point.
-- The raw network output is unbounded, so `exp` of a large log-ratio can overflow; clip the exponent if the shape parameters are free to wander far.
+- **Cost**: the kernel is evaluated at every wavelength sample of every sub-pixel of every source, and an MLP costs far more per point than the closed-form blackbody, so this slows the forward model *and* each interleaved amplitude solve (which rebuilds the postage stamps). Since the caller supplies the $\lambda_0$ value, the MLP runs exactly `n_wavelength_samples` times per sub-pixel (measured: 2.05x fewer MLP evaluations than the old contract at `n_wavelength_samples = 1`); keep `hidden_size` modest.
+- The output is a log-flux, so it is unbounded — but the caller exponentiates the *difference* to its value at $\lambda_0$, which is bounded. No clipping is needed.
+
+**Wavelength embedding (Fourier features).** The wavelength is not fed to the network raw. It is expanded into `ln(lambda)` plus `sin`/`cos` of `n_embeddings` geometrically spaced frequencies, $k_i = 2^i\pi/\Delta\ln\lambda$ with `delta_ln_wavelength` defaulting to $\ln(5/0.75)$ (the full range). The i-th frequency completes $2^{i-1}$ cycles across the span, so the finest one has a period of $2\,\Delta\ln\lambda/2^{n}$ — a constant *fraction* of the wavelength (~3% at the defaults, i.e. ~128 samples per e-folding of $\lambda$).
+
+Log-wavelength space rather than $\lambda$ is deliberate, and matches the instrument: a SPHEREx bandpass has a constant fractional width, $\sigma_\lambda/\lambda_c = 1/(2.355R)$, just as emission lines, absorption edges and dust features are quasi-log-periodic. Embedding $\lambda$ linearly gives each Fourier feature a fixed *absolute* period, so its richness relative to the bandpass drifts across the range — the fluctuations become relatively too rapid at long wavelengths and too coarse at short ones. Measured in-bandpass peak-to-peak $\log(\text{shape})$ at `n_embeddings = 8` (across $\lambda_c \pm 2\sigma_t$, median over 32 draws from the prior): linear embedding 0.28 / 0.72 / 1.00 for bands 1 / 3 / 6, versus log embedding 0.39 / 0.90 / 0.33. The log version is the physically sensible one — band 6, with the highest resolving power ($R = 130$), now shows the *least* relative variation, whereas the linear version made it the most.
+
+This expands what the model can represent but not how many free parameters it has: the frequencies are fixed, so $\theta$ still selects a one-parameter family of curves. The extra cost is $2\,n_\text{embeddings}$ transcendentals per call. **Caveat:** finer features mean the `n_lambda = 1` quantile integration is less faithful — see §6.4.
 
 ### 3.3 `GaussianPSF` (`spherex/psf.py`)
 
@@ -187,14 +210,20 @@ SpherexImageGenerator3.__call__()
   └─ ImageGenerator3.__call__()
        └─ jax.lax.map(_one_stamp, sources, batch_size=...)
             └─ _one_stamp() per source
+                 ├─ normalized_source_params(model, params)   ← ONCE per source:
+                 │     log_amplitude -= model(lambda_0, theta)   folds the
+                 │     LAMBDA_0 normalisation into the amplitude
                  └─ jax.vmap(_one_subpixel_rate) over K² sub-pixels
                       └─ _one_subpixel_rate() per sub-pixel
                            ├─ transmission.quantile(q, omega_p) → K_λ wavelengths
-                           ├─ spectrum_model(wavelengths, params) → f_λ
+                           ├─ spectrum_model(wavelengths, theta) → log-flux
+                           ├─ exp(log_amplitude + log_flux) → f_λ
                            ├─ psf(omega_p, omega_s, wavelengths) → PSF vals
                            └─ jnp.mean((λ/HC) * f_λ * PSF_val) * norm
        └─ scatter-add stamps into full image
 ```
+
+Note the placement of the fold: it is the *only* step that needs $\lambda_0$, it depends on neither the wavelength nor the pixel, and it happens once per source. Putting it inside the spectrum model would re-run it for every sub-pixel of every source.
 
 ### Key details
 
@@ -356,13 +385,20 @@ python scripts/mock_spherex_images.py --spectrum nn --nn-shape-check
 
 **`--nn-shape-check` (run this first).** A flexible model can fail *before* any fitting happens — either because θ does not move the in-band shape (θ is then unidentifiable however long you fit) or because the frozen net's spectra span too many decades to be comparable to the blackbody run. The check answers both:
 
-* per-band log-shape range over draws from the prior, e.g. (seed 0) band 1 `[-0.02, +0.06]`, band 6 `[-1.37, -1.20]`;
-* the singular values of $\partial \log \text{shape} / \partial \theta$ on the sampled wavelength grid: near-zero singular values are directions that leave the spectrum unchanged. Seed 0 gives `[46.0]` for `P = 1` (rank 1, condition number 1) and `[31.8, 8.1, 5.2]` for `P = 3` (rank 3, condition number 6.1), so θ is well constrained by the band coverage at both settings — but at `P = 3` the parameters are near the information limit of six bands, so treat large `P` as a test of the plumbing rather than as a physically meaningful model;
-* `shape(λ; θ)` for 64 prior draws, plus the implied photon counts.
+* per-band log-shape range over draws from the prior, e.g. at the mock's defaults (seed 314159, 2x16, 8 embeddings) band 1 `[-0.02, +2.11]` and band 6 `[+1.09, +2.56]`;
+* the singular values of $\partial \log \text{shape} / \partial \theta$ on the sampled wavelength grid: near-zero singular values are directions that leave the spectrum unchanged. That configuration gives `[8.42]` for `P = 1` (rank 1, condition number 1); an earlier seed with a 3x32 network gave `[31.8, 8.1, 5.2]` at `P = 3` (rank 3, condition number 6.1), so $\theta$ is well constrained by the band coverage at both settings — but at `P = 3` the parameters are near the information limit of six bands, so treat large `P` as a test of the plumbing rather than as a physically meaningful model;
+* `shape(λ; θ)` for 64 prior draws, plus the implied photon counts. The grid is log-spaced (see `_wavelength_grid`), because the Fourier embedding is log-periodic and a linear grid would under-sample its finest features at short wavelengths.
 
-**Reading the results.** Since a random net's θ has no physical meaning, `plots/comparison.svg` (θ vs θ) is only a parameter-recovery check; the interpretable diagnostic is `plots/spectra_comparison.svg`, which overlays the true and recovered *spectra* for the brightest sources and reports the median $|\Delta \log \text{shape}|$ over them. In the small-scale smoke runs (`N_SOURCES = 12`, 4 exposures, 64 SGD steps), both models reach $\chi^2/\text{pixel} = 0.993$ at the *true* parameters and 0.994–0.996 at the recovered ones, with a median $|\Delta \log \text{shape}|$ of ~0.12–0.31 dex for the few bright sources.
+**Reading the results.** Since a random net's θ has no physical meaning, `plots/comparison.svg` (θ vs θ) is only a parameter-recovery check; the interpretable diagnostic is `plots/spectra_comparison.svg`, which overlays the true and recovered *spectra* for the brightest sources and reports the median $|\Delta \log \text{shape}|$ over them. In the small-scale smoke runs (`N_SOURCES = 12`, 4 exposures, 48 SGD steps), both models reach $\chi^2/\text{pixel} = 0.9932$ at the *true* parameters and 0.9933–0.9948 at the recovered ones, with a median $|\Delta \log \text{shape}|$ of ~0.03–0.31 dex for the few bright sources.
 
-**Cost.** A 3×32 MLP costs much more arithmetic per wavelength sample than the closed-form Planck function, and the shape is evaluated at every sample of every sub-pixel of every source. Measured on an identical problem (8 sources, band 3, `half_stamp = 10`, `n_lambda = 1`, oversampling 2), the forward model takes 215 ms with the blackbody and 263 ms with the network — only +22%, because the PSF evaluation, sub-pixel bookkeeping and scatter-add dominate the per-pixel work rather than the spectrum evaluation. End to end at the small scale above (12 sources, 4 exposures), 64 SGD steps took 12.0 s versus 16.0 s. Expect the gap to widen with `hidden_size` and `n_lambda`.
+**Cost.** The kernel is evaluated at every wavelength sample of every sub-pixel of every source, and an MLP costs far more arithmetic per point than the closed-form Planck function, so this slows the forward model *and* each interleaved amplitude solve (which rebuilds the postage stamps). Two things keep the overhead modest:
+
+* The caller supplies the $\lambda_0$ value, so the MLP runs exactly `n_wavelength_samples` times per sub-pixel instead of `n_wavelength_samples + 1`. Measured on one band-3 stamp (1764 sub-pixel entries, `n_lambda = 1`), the model-side cost drops from 5.01 ms to 2.44 ms — **2.05× fewer MLP evaluations** (1.55× at `n_lambda = 5`, as expected from $(N_\lambda+1)/N_\lambda$).
+* That work is small next to the rest of the per-sub-pixel cost (quantile sampling, PSF evaluation, sub-pixel bookkeeping, scatter-add). Paired end-to-end smoke runs (12 sources, 4 exposures, 48 SGD steps) take 12.0/11.6 s with the blackbody, 13.4/13.5 s with an unembedded 2x16 network, and 14.8/14.8 s with the default 8-embedding network — i.e. roughly +14% for the network and a further +11% for the Fourier embedding.
+
+**Quadrature is the price of a flexible shape.** A bandpass integral taken with `n_lambda = 1` is exact only for a shape that varies slowly across the filter. Fourier features deliberately allow faster variation, so the forward model's fidelity is model-dependent — measured as the relative RMS of a band-3 image between `n_lambda = 1` and `n_lambda = 63`, it is ~1.3e-5 for the blackbody, ~1e-6 at `n_embeddings = 0`, ~1e-5 at 2, ~1e-4 at 4 and ~4e-3 (worst pixels ~10%) at the default 8. This does *not* bias a mock run, because generation and fitting share the same `n_lambda`; it does mean the simulated bands stop being faithful band-integrated fluxes, so `--compare-n-lambda` should be re-checked after any change to `n_embeddings`, and either that or `N_LAMBDA` adjusted (raising `N_LAMBDA` multiplies the MLP cost by the same factor, so lowering `n_embeddings` is usually the cheaper lever).
+
+The one deliberately unoptimised factor that remains is that the shape is evaluated separately for every pixel *column* of a stamp even though the wavelength samples depend only on the row — see §7.20 for why, and for what it would take to remove it.
 
 ---
 
@@ -458,6 +494,16 @@ Second, a flexible model can be unfittable regardless of the optimiser: if a dir
 
 Also worth remembering when *interpreting* the fit: with a random network, θ has no physical meaning, so the θ-vs-θ scatter is only a parameter-recovery plot; the scientifically meaningful diagnostic is whether the recovered *spectrum* matches the true one (`plot_spectra_comparison`), and its error should be quoted in dex of log-shape rather than as a parameter offset.
 
+### 7.20 Where the `LAMBDA_0` normalisation lives — and why not a shared wavelength grid
+
+The spectrum models return an unnormalised log-flux and know nothing about `LAMBDA_0`; the caller anchors them by folding the constant into the amplitude **once per source** (§2.1, §4). Two decisions behind that are worth recording.
+
+**Log space, not linear space.** If the models returned an unnormalised *linear* kernel, the caller would have to compute `exp(raw(λ)) / exp(raw(λ₀))`. A randomly initialised network's raw output carries an offset that is (i) independent of wavelength, (ii) unconstrained by the data — an exact null direction of the likelihood, so θ can random-walk along it — and (iii) potentially large, because the output rescaling of §6.4 scales only the final *weight* block and leaves the final *bias* (which is precisely that offset) untouched. The ratio could therefore overflow float32 to `inf/inf`. Exponentiating a *difference* in log space cannot: the difference is bounded by the shape's own dynamic range. It also removes the `exp` from the model entirely, and drops the number of `λ₀` evaluations from one per sub-pixel to one per source.
+
+**Why the shape is still evaluated per sub-pixel rather than per sub-pixel row.** The bandpass central wavelength is `λ_c(y) = λ_intercept + λ_slope·y`, so the quantile wavelengths used for entry `[i, j, v, u]` of a stamp depend only on `(i, u)`: a stamp of size `S` has just `S·K` distinct λ vectors, while the shape is evaluated `S²·K²` times — a 42× (band 1) to 186× (band 6) redundancy at the mock's defaults. Collapsing it (evaluate the shape on those distinct rows, broadcast over the column axis) is exact *for a purely y-dependent calibration* — but the real SPHEREx wavelength calibration has a slight x-dependence, so each sub-pixel keeps its own quantile evaluation. The cost of that correctness is the factor above.
+
+This refines rather than contradicts the frozen note in `image2.py`: that note rules out hoisting over the *whole* stamp (different rows really do have different `λ_c`), whereas the row collapse only shares λ across the column axis. If the remaining cost ever matters, the exact fix is to evaluate the shape once on the union of quantile wavelengths actually used by the stamp and gather into place; the approximate fix is to tabulate the shape per source on a λ grid and interpolate — the shape depends only on λ, so the calibration's x-dependence does not invalidate that route.
+
 ---
 
 ## 8. File Map
@@ -465,11 +511,11 @@ Also worth remembering when *interpreting* the fit: with a random network, θ ha
 | File | Purpose |
 |---|---|
 | `spherex/constants.py` | Physical constants in codebase-native units (kJ, µm, arcsec) |
-| `spherex/spectrum.py` | `BlackbodySpectrum` (analytic) and `NeuralNetSpectrum` (MLP) — shape-only source spectrum templates, both normalised to 1 at the global `LAMBDA_0`, plus the `[log_amplitude, shape…]` layout helpers |
+| `spherex/spectrum.py` | `BlackbodySpectrum` (analytic) and `NeuralNetSpectrum` (MLP) — unnormalised log-flux templates — plus the `[log_amplitude, shape…]` layout helpers and the caller-side `LAMBDA_0` anchors (`reference_log_flux`, `normalized_log_shape`, `normalized_shape`, `normalized_source_params`) |
 | `spherex/psf.py` | `GaussianPSF` — wavelength-dependent Gaussian PSF |
 | `spherex/transmission.py` | `GaussianFilterTransmission` — LVF transmission with quantile interface |
-| `spherex/image.py` | `_one_subpixel_rate` (quantile integration; splits amplitude out of `source_params`), `ImageGenerator` (scan-based) |
-| `spherex/image3.py` | `ImageGenerator3` (chunked-batch, uses `_one_subpixel_rate` from `image.py`), plus `source_stamps` for the amplitude-solve preconditioner |
+| `spherex/image.py` | `_one_subpixel_rate` (quantile integration; applies `exp(log_amplitude + log_flux)` for pre-normalised params), `photon_rate_per_pixel` (normalises once per source), `ImageGenerator` (scan-based) |
+| `spherex/image3.py` | `ImageGenerator3` (chunked-batch, uses `_one_subpixel_rate` from `image.py`; folds the `LAMBDA_0` normalisation once per source in `_stamp_batch`), plus `source_stamps` for the amplitude-solve preconditioner |
 | `spherex/config.py` | `SpherexImageGenerator`, `SpherexImageGenerator3` — pre-configured per-band generators, `_build_band(..., spectrum_model=None)` (the spectrum-model injection point), band table |
 | `spherex/__init__.py` | Public API exports |
 | `scripts/inference.py` | `infer_parameters` (SGD, with amplitude interlace), `infer_parameters_lm` (LM), `solve_log_amplitudes` (direct amplitude least-squares), `compute_loss`, `compute_lm_loss`, `plot_loss_history`, `plot_comparison` (one panel per parameter, `1 + P`), residual functions, custom LM solver |

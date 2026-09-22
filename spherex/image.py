@@ -10,7 +10,7 @@ import jax
 import jax.numpy as jnp
 
 from .constants import HC_JAX
-from .spectrum import split_source_params
+from .spectrum import normalized_source_params, split_source_params
 
 
 # ---------------------------------------------------------------------------
@@ -79,10 +79,18 @@ def _one_subpixel_rate(
     ``source_params`` holds the per-source parameters with the
     **log-amplitude in the first column** (see
     ``spherex.spectrum.LOG_AMPLITUDE_INDEX``).  The spectrum model receives
-    only ``source_params[..., 1:]`` and therefore describes the spectral
-    *shape* only; the generator multiplies the amplitude back in here::
+    only ``source_params[..., 1:]`` and returns that source's **unnormalised
+    log-flux**; the generator therefore evaluates
+    ``exp(log_amplitude + spectrum_model(lambda, shape_params))``, i.e.::
 
-        f_λ(λ) = exp(log_amplitude) * spectrum_model(λ, shape_params)
+        f_λ(λ) = exp(log_amplitude) * exp(spectrum_model(λ, shape_params))
+
+    IMPORTANT: ``source_params`` must already be **normalised at LAMBDA_0**,
+    i.e. produced by ``spherex.spectrum.normalized_source_params``.  That is
+    the caller's job (`photon_rate_per_pixel` and the generators do it once
+    per source) and it is what keeps the amplitude meaning
+    ``f_lambda(LAMBDA_0)``.  Doing it here would re-evaluate a
+    wavelength-independent quantity once per sub-pixel.
 
     The integral is estimated via quantile / inverse-CDF importance
     sampling against the transmission profile itself, rather than fixed
@@ -107,8 +115,12 @@ def _one_subpixel_rate(
     norm = transmission.total_transmission(omega_p)           # scalar
 
     log_amplitude, shape_params = split_source_params(source_params)
-    shape = spectrum_model(lambdas, shape_params)             # (N_λ,)
-    f_lam = jnp.exp(log_amplitude) * shape                    # (N_λ,)
+    # The model returns an unnormalised log-flux, so the amplitude, the shape
+    # and the LAMBDA_0 normalisation (folded into log_amplitude by the caller)
+    # all combine inside a single exp.
+    f_lam = jnp.exp(
+        log_amplitude + spectrum_model(lambdas, shape_params)
+    )                                                          # (N_λ,)
 
     psf_val = psf(omega_p, omega_s, lambdas)                  # (N_λ,)
 
@@ -148,8 +160,11 @@ def photon_rate_per_pixel(
     source_params : shape ``(1 + P,)``
         Per-source parameters with the log-amplitude in the first column and
         the spectrum-shape parameters (e.g. log-temperature) in the rest.
+        These may be given in physical form (``log_amplitude`` =
+        ``log f_lambda(LAMBDA_0)``); they are normalised internally.
     spectrum_model : equinox.Module
-        Spectrum-shape template (e.g. ``BlackbodySpectrum``).
+        Spectrum-shape template (e.g. ``BlackbodySpectrum``), returning an
+        unnormalised log-flux (see ``spherex.spectrum``).
     psf : equinox.Module
         PSF model.
     transmission : equinox.Module
@@ -168,6 +183,11 @@ def photon_rate_per_pixel(
     jnp.ndarray (scalar)
         Photon detection rate in s⁻¹.
     """
+    # Normalise the source's amplitude at LAMBDA_0 once, here, rather than
+    # letting every sub-pixel re-evaluate the (wavelength-independent)
+    # normalisation constant.
+    source_params = normalized_source_params(spectrum_model, source_params)
+
     # Integrate over wavelength for each sub-pixel centre
     sub_rates = jax.vmap(
         _one_subpixel_rate,
@@ -205,8 +225,12 @@ class ImageGenerator(eqx.Module):
     transmission : equinox.Module
         Filter transmission model (shared across all sources).
     spectrum_model : equinox.Module
+    spectrum_model : equinox.Module
         Spectrum template (shared; per-source parameters are passed at
-        call time).
+        call time).  It returns an **unnormalised log-flux** (see
+        ``spherex.spectrum``); the generator anchors it at
+        :data:`~spherex.spectrum.LAMBDA_0` itself, so the amplitude keeps its
+        meaning as ``f_lambda(LAMBDA_0)``.
     aperture : float
         Telescope aperture in m².
 
@@ -218,7 +242,8 @@ class ImageGenerator(eqx.Module):
 
     ``source_params`` has shape ``(S, 1 + P)``: the log-amplitude in the first
     column and the spectrum-shape parameters (passed to ``spectrum_model``) in
-    the rest.
+    the rest.  The amplitude is the physical ``log f_lambda(LAMBDA_0)``; the
+    generator folds the model's normalisation into it once per source.
     """
 
     psf: eqx.Module
@@ -261,6 +286,12 @@ class ImageGenerator(eqx.Module):
         # ---- per-source scan body -----------------------------------------
         def _one_stamp(image, src):
             pixel_xy, params_s = src          # (2,) in pixel coordinates
+
+            # Fold the LAMBDA_0 normalisation into the amplitude ONCE for this
+            # source.  Everything below then evaluates a single exp per
+            # wavelength; the spectrum model itself is anchor-free (see
+            # ``spherex.spectrum``).
+            params_s = normalized_source_params(self.spectrum_model, params_s)
 
             jc = jnp.floor(pixel_xy[0]).astype(jnp.int32)
             ic = jnp.floor(pixel_xy[1]).astype(jnp.int32)
