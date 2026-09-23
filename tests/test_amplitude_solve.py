@@ -20,6 +20,7 @@ from spherex import SpherexImageGenerator3, BlackbodySpectrum  # noqa: E402
 from inference import (  # noqa: E402
     EXPOSURE_TIME,
     compute_loss,
+    infer_parameters,
     solve_log_amplitudes,
 )
 
@@ -142,6 +143,69 @@ def test_solve_leaves_shapes_untouched():
 def test_spectrum_model_has_no_amplitude():
     """Guard: the spectrum model must remain shape-only."""
     assert BlackbodySpectrum().n_params == 1
+
+
+# ---------------------------------------------------------------------------
+# The solve runs BEFORE the first SGD step
+# ---------------------------------------------------------------------------
+
+def test_infer_parameters_solves_amplitudes_before_the_first_step():
+    """``infer_parameters`` must solve for the amplitudes up front.
+
+    The drawn initial amplitudes are wrong by an arbitrary factor, so the early
+    gradients - and the statistics the RMS preconditioner accumulates from them
+    - would be dominated by an amplitude error the exact solve removes.  Two
+    things are checked, and both would fail if the solve only happened at the
+    ``amp_solve_every`` cadence or at the end of the loop:
+
+    1. the *first* recorded loss (taken after step 0) is already the post-solve
+       loss, not the raw initialisation's;
+    2. the returned amplitudes are the least-squares solution for the INITIAL
+       shapes and backgrounds.
+
+    ``learning_rate=0`` makes the SGD steps no-ops, so the only thing that can
+    change the parameters is the solve, and ``amp_solve_every`` is set beyond
+    ``n_steps`` so the interlace never triggers within the loop.
+    """
+    exposures, log_backgrounds, true_log_params = _make_problem(seed=3)
+
+    # True shapes (so the amplitude solution is exact), amplitudes wrong by
+    # a factor exp(2) ~ 7.4.
+    init = true_log_params.at[:, 0].add(2.0)
+    raw_loss = float(compute_loss(
+        exposures, init, log_backgrounds,
+        n_lambda=N_LAMBDA, oversampling=OVERSAMPLING,
+    ))
+
+    rec_params, rec_backgrounds, losses, _lrs = infer_parameters(
+        exposures, init,
+        n_steps=2, learning_rate=0.0, momentum=0.0, warmup_steps=0,
+        n_lambda=N_LAMBDA, oversampling=OVERSAMPLING,
+        amp_solve_every=10_000,          # never fires: isolate the initial solve
+    )
+
+    # (1) The solve already happened before the first recorded step.
+    assert losses[0] < raw_loss / 10.0
+
+    # (2) It is the exact solution for the initial shapes and the backgrounds
+    #     the routine itself initialised (median of each image).
+    solved, _stats = solve_log_amplitudes(
+        exposures, init, rec_backgrounds,
+        n_lambda=N_LAMBDA, oversampling=OVERSAMPLING,
+    )
+    np.testing.assert_allclose(
+        np.asarray(rec_params[:, 0]), np.asarray(solved),
+        rtol=1e-5, atol=1e-6,
+    )
+    # With the true shapes held fixed (lr = 0), that solution is the true one.
+    np.testing.assert_allclose(
+        np.asarray(rec_params[:, 0]), np.asarray(true_log_params[:, 0]),
+        rtol=1e-3, atol=1e-4,
+    )
+    # ...and no SGD step moved anything.
+    np.testing.assert_array_equal(
+        np.asarray(rec_params[:, 1:]), np.asarray(init[:, 1:]),
+    )
 
 
 # ---------------------------------------------------------------------------

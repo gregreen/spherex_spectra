@@ -408,8 +408,12 @@ def test_layer_norm_is_passed_through_and_fingerprinted():
     The option is a per-wavelength feature normalisation (see
     ``NeuralNetSpectrum``), so it must not change any other weight for a given
     seed - only add its own, which the frozen-weights guarantee then covers.
+
+    Both variants are requested EXPLICITLY, so this tests the flag rather than
+    whatever ``NN_LAYER_NORM`` happens to be set to in the mock's config.
     """
-    plain = mock._build_spectrum_model(kind="nn", verbose=False)
+    plain = mock._build_spectrum_model(kind="nn", layer_norm=False,
+                                       verbose=False)
     normed = mock._build_spectrum_model(kind="nn", layer_norm=True,
                                        verbose=False)
 

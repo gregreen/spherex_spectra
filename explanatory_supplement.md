@@ -287,7 +287,7 @@ Inference is in `scripts/inference.py`. Two optimizers are available (SGD and Le
 - Optimizer: `clip(1.0) → scale_by_rms → sgd(momentum, warmup_cosine_decay_schedule)`
 - Learning rate: linear warmup from 0 to peak, then cosine decay to 0 (default peak `learning_rate=1e-2`, `warmup_steps=50`, `momentum=0.5`)
 - The entire training step (loss + grad + update) is compiled into a single `jax.jit` via `_make_train_step`
-- The amplitude least-squares solve is interleaved every `amp_solve_every` SGD steps (default **16**; cf. §5.6)
+- **One amplitude least-squares solve runs BEFORE the first SGD step**, then one every `amp_solve_every` steps (default **16**), then one final solve after the loop (cf. §5.6). The initial solve matters more than it looks: the drawn amplitudes are uniform in log A, i.e. wrong by an arbitrary factor, so the first loss is enormous and every early gradient — including the per-parameter statistics `optax.scale_by_rms` accumulates from them — is dominated by amplitude error rather than by the spectral shape. Because the model is exactly linear in amplitude the solve is exact, so it costs one CG solve (the solver is built once and reused) and leaves the best possible starting point for the amplitude block. `opt_state` is rebuilt afterwards so the momentum/RMS state belongs to the solved parameters. Measured on the mock's defaults (P = 3, 16 sources, 6 exposures): $\chi^2/\text{pixel}$ $3.4\times10^5 \rightarrow 1.06$ before any SGD step.
 - Returns `(log_params, log_backgrounds, losses, lrs)`
 
 ### 5.3 Levenberg-Marquardt (`infer_parameters_lm`)

@@ -131,9 +131,9 @@ N_LAMBDA = 1
 SPECTRUM_KIND = "nn"
 
 # Neural-network hyperparameters (only used if SPECTRUM_KIND = "nn")
-NN_N_PARAMS = 3
+NN_N_PARAMS = 2
 NN_N_HIDDEN_LAYERS = 2
-NN_HIDDEN_SIZE = 16
+NN_HIDDEN_SIZE = 4
 NN_SEED = 314159
 
 # FiLM conditioning: theta does not enter the network as an input feature, it
@@ -146,7 +146,7 @@ NN_SEED = 314159
 # theta"; raise it for more capacity.  NN_FILM_HIDDEN_LAYERS = 0 would make
 # each branch a single linear map instead of a small MLP.
 NN_FILM_HIDDEN_LAYERS = 1
-NN_FILM_SIZE_FACTOR = 2.0
+NN_FILM_SIZE_FACTOR = 1.0
 
 # Optional LayerNorm after the activation of every hidden layer (see
 # ``NeuralNetSpectrum``), normalising the features of ONE wavelength so it can
@@ -156,7 +156,7 @@ NN_FILM_SIZE_FACTOR = 2.0
 # does not REMOVE that rescaling - the achieved spread still varies with the
 # seed.  Off by default so the recorded benchmark numbers keep their meaning;
 # flip it here or pass --nn-layer-norm.
-NN_LAYER_NORM = True
+NN_LAYER_NORM = False
 
 # Fourier (positional) embedding of the wavelength: the input vector carries
 # ln(wavelength) plus sin/cos of NN_N_EMBEDDINGS geometrically spaced
@@ -1778,9 +1778,9 @@ def end_to_end_mock(use_lm=False, spectrum_model=None):
         rec_log_params, log_backgrounds, losses, lrs = infer_parameters(
             inf_exposures,
             init_log_params,
-            n_steps=256,
-            learning_rate=1e-2,
-            momentum=0.3,
+            n_steps=1024,
+            learning_rate=5e-3,
+            momentum=0.5,
             warmup_steps=16,
             n_lambda=N_LAMBDA,
             oversampling=2,

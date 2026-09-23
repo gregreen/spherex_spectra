@@ -847,12 +847,13 @@ def infer_parameters(
     preconditioned SGD, interleaved with a direct amplitude least-squares
     solve.
 
-    The parameter vector per source is ``[log_amplitude, log_temperature]``
+    The parameter vector per source is ``[log_amplitude, log_T, theta...]``
     (amplitude FIRST - see ``spherex.spectrum``).  In addition to plain SGD
-    on all parameters, every ``amp_solve_every`` steps the log-amplitude
-    column is replaced by the closed-form least-squares solution from
-    :func:`solve_log_amplitudes` (shapes and backgrounds held fixed) - see
-    that function for why this is exact rather than approximate.
+    on all parameters, the log-amplitude column is replaced by the closed-form
+    least-squares solution from :func:`solve_log_amplitudes` (shapes and
+    backgrounds held fixed): **once before the first SGD step**, then again
+    every ``amp_solve_every`` steps, and once more after the loop - see that
+    function for why this is exact rather than approximate.
 
     Parameters
     ----------
@@ -897,13 +898,17 @@ def infer_parameters(
         warmup-cosine learning-rate schedule).
     amp_solve_every : int or None
         Interlace the direct amplitude least-squares solve every this many
-        SGD steps (default 16), plus one final solve after the loop.
-        ``None`` (or 0) disables the interlace.
+        SGD steps (default 16), plus one final solve after the loop and one
+        *before* the first step.  ``None`` (or 0) disables the interlace
+        entirely.
     amp_cg_max_steps : int or None
         Iteration cap for the amplitude solve's inner CG.
     amp_verbose : bool
-        If True, print the loss before/after each interleaved amplitude
-        solve (requires an extra loss evaluation per solve).
+        If True, print the loss before/after each amplitude solve (requires
+        an extra loss evaluation per solve).  The ``before`` value is measured
+        at the parameters the solve is about to change, so the pair refers to
+        ONE parameter set; the loss ``train_step`` returns during the same
+        iteration is a different quantity (see the loop).
 
     Returns
     -------
@@ -978,6 +983,27 @@ def infer_parameters(
                   "solution; amplitudes left unchanged.")
         return log_params.at[:, 0].set(log_amp)
 
+    # ---- ONE solve before the first SGD step -------------------------------
+    # The initial amplitudes come from a model-specific draw (uniform in
+    # log A), so they are wrong by an arbitrary factor: every early gradient is
+    # then dominated by that error, and the RMS preconditioner accumulates its
+    # per-parameter statistics from exactly those gradients.  Since the model
+    # is linear in amplitude, the solve lands on the optimal amplitude for the
+    # current shapes and backgrounds, so the cost is one CG solve and the
+    # starting point is as good as its amplitude block can be.
+    # ``opt_state`` is rebuilt afterwards, so the optimiser's momentum and RMS
+    # state belong to the SOLVED parameters rather than to the raw draw.
+    if do_amp_solve:
+        before = (float(loss_fn(log_params, log_backgrounds))
+                  if amp_verbose else None)
+        log_params = _amp_solve(log_params, log_backgrounds)
+        params = (log_params, log_backgrounds)
+        opt_state = optimiser.init(params)
+        if amp_verbose:
+            after = float(loss_fn(*params))
+            print(f"  [amp-solve] initial (pre-SGD) solve: "
+                  f"loss {before:.4e} -> {after:.4e}")
+
     losses = []
     learning_rates = []
 
@@ -992,12 +1018,21 @@ def infer_parameters(
         log_params, log_backgrounds = params
 
         if do_amp_solve and (step + 1) % amp_solve_every == 0:
+            # Measure the loss at the parameters the solve is about to change,
+            # so that the printed pair refers to ONE parameter set.  ``loss_val``
+            # from this iteration is NOT that quantity: ``train_step`` returns
+            # the loss at the parameters ENTERING the step, i.e. before this
+            # step's SGD update, so quoting it here mixes two parameter sets and
+            # reads as though the loss had jumped back up.  The entry value is
+            # reported alongside, for reference.
+            if amp_verbose:
+                pre = float(loss_fn(log_params, log_backgrounds))
             log_params = _amp_solve(log_params, log_backgrounds)
             params = (log_params, log_backgrounds)
             if amp_verbose:
-                post = float(loss_fn(log_params, log_backgrounds))
-                print(f"  [amp-solve @ step {step}] "
-                      f"loss {float(loss_val):.4e} -> {post:.4e}")
+                post = float(loss_fn(*params))
+                print(f"  [amp-solve @ step {step}] loss {pre:.4e} -> "
+                      f"{post:.4e}   (entry {float(loss_val):.4e})")
 
         losses.append(float(loss_val))
         lr = float(schedule(step))
