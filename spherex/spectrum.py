@@ -470,6 +470,34 @@ class NeuralNetSpectrum(eqx.Module):
     means ``theta`` is never ignored, even at ``n_hidden_layers = 0``, where
     the input projection's branch would be its only route into the network.
 
+    Optional layer normalization
+    ----------------------------
+    With ``layer_norm=True`` an ``eqx.nn.LayerNorm`` is inserted after the
+    activation of every activated layer.  This is a **per-wavelength**
+    operation: it standardises the ``hidden_size`` features of ONE wavelength's
+    hidden vector, so the value returned for a given ``(theta, wavelength)``
+    cannot depend on which other wavelengths or ``theta`` values share the
+    batch.  Normalising over the *wavelength* axis would do exactly that and is
+    deliberately not offered - it would make ``f_lambda`` a function of the
+    caller's wavelength grid.
+
+    Why it is an option rather than always on: it changes how much spectral
+    structure a *randomly initialised* network has.  Measured raw per-source
+    log-shape std over 0.75-5 um at the mock's defaults (1x32, 8 embeddings,
+    seed 314159): 0.015 without normalization versus 0.100 with it - i.e. the
+    output rescaling the mock applies afterwards needs a factor of ~33 instead
+    of ~5.  It does NOT remove the need for that rescaling, because
+    normalization divides by a *wavelength-dependent* quantity and so cannot
+    pin a statistic defined over wavelengths; the achieved spread still varies
+    with the seed (a factor 4.4-17.6 over three seeds at 2x16).  Once the
+    weights are *trained* that argument disappears and the normalization is an
+    ordinary architectural choice.
+
+    It costs ``2 * hidden_size`` parameters per activated layer (the affine
+    scale and offset, initialised to 1 and 0 - identity, which is what makes it
+    a pure standardisation at initialisation) plus a feature-axis mean and
+    variance per wavelength sample.
+
     Batching convention
     -------------------
     ``__call__`` handles the wavelengths of a SINGLE source::
@@ -522,6 +550,11 @@ class NeuralNetSpectrum(eqx.Module):
         default 1.0 makes the branch exactly as wide as ``theta`` itself, so
         the modulation is never a narrower bottleneck than ``theta``; raise it
         to give the branches more capacity.  Must be positive.
+    layer_norm : bool, optional
+        Insert an ``eqx.nn.LayerNorm`` after the activation of every activated
+        layer (default ``False``).  It normalises the feature axis of ONE
+        wavelength, so it never couples the wavelengths or sources evaluated
+        together - see the "Optional layer normalization" note above.
     key : jax.Array
         PRNG key used to initialise the layers (``eqx.nn.Linear`` requires
         one).
@@ -578,6 +611,8 @@ class NeuralNetSpectrum(eqx.Module):
 
     layers: list
     film: list
+    norms: list
+    layer_norm: bool
     n_params: int
     n_hidden_layers: int
     hidden_size: int
@@ -597,6 +632,7 @@ class NeuralNetSpectrum(eqx.Module):
         delta_ln_wavelength: float = DEFAULT_DELTA_LN_WAVELENGTH,
         film_hidden_layers: int = 1,
         film_hidden_size_factor: float = 1.0,
+        layer_norm: bool = False,
         *,
         key: jax.Array,
     ):
@@ -622,6 +658,10 @@ class NeuralNetSpectrum(eqx.Module):
         film_hidden_size_factor : float, optional
             Width of each FiLM branch's hidden layers relative to ``theta``
             (default: 1.0, i.e. as wide as ``theta`` itself).
+        layer_norm : bool, optional
+            Normalise the hidden features of each wavelength (default: False);
+            per-wavelength, so it cannot couple batched calls (see the class
+            docstring).
         key : jax.Array
             PRNG key for layer initialisation.
         """
@@ -632,6 +672,7 @@ class NeuralNetSpectrum(eqx.Module):
         self.delta_ln_wavelength = delta_ln_wavelength
         self.film_hidden_layers = film_hidden_layers
         self.film_hidden_size_factor = float(film_hidden_size_factor)
+        self.layer_norm = bool(layer_norm)
         if self.film_hidden_size_factor <= 0.0:
             raise ValueError(
                 "film_hidden_size_factor must be positive, got "
@@ -684,6 +725,16 @@ class NeuralNetSpectrum(eqx.Module):
             )
             for i in range(len(layers) - 1)
         ]
+
+        # Optional LayerNorm, one per activated layer and aligned with
+        # `self.film`.  eqx's default initialisation is the identity affine
+        # (weight = 1, bias = 0), so at this point it is a pure feature-axis
+        # standardisation; `weight`/`bias` are nonetheless parameters, so a
+        # caller that TRAINS the model trains them too.
+        self.norms = (
+            [eqx.nn.LayerNorm((hidden_size,)) for _ in range(len(layers) - 1)]
+            if self.layer_norm else []
+        )
 
     def _embed_wavelength(self, wavelength: jnp.ndarray) -> jnp.ndarray:
         """Fourier (positional) embedding of ONE wavelength.
@@ -753,10 +804,19 @@ class NeuralNetSpectrum(eqx.Module):
         this a pure function of ``(features, film)``, which is what lets
         :meth:`__call__` ``vmap`` over wavelengths without re-running the FiLM
         branches each time.
+
+        When ``layer_norm`` is on, each activated layer is followed by its
+        normalization.  Both operations act on a SINGLE wavelength's feature
+        vector, which is what keeps the result independent of the rest of the
+        batch.
         """
         x = wavelength_features
-        for layer, (gamma, beta) in zip(self.layers[:-1], film_params):
+        for i, (layer, (gamma, beta)) in enumerate(
+            zip(self.layers[:-1], film_params)
+        ):
             x = jax.nn.silu(gamma * layer(x) + beta)
+            if self.layer_norm:
+                x = self.norms[i](x)
         return jnp.squeeze(self.layers[-1](x), axis=-1)
 
     def raw_neural_net(

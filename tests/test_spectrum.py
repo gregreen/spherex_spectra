@@ -565,3 +565,127 @@ def test_neural_net_without_hidden_layers_still_reacts_to_theta():
     b = np.asarray(normalized_log_shape(model, lam, jnp.array([1.0, 1.0])))
     assert np.max(np.abs(a - b)) > 1e-6
 
+
+# ---------------------------------------------------------------------------
+# NeuralNetSpectrum: optional per-wavelength LayerNorm
+# ---------------------------------------------------------------------------
+#
+# LayerNorm normalises the hidden_size features of ONE wavelength's hidden
+# vector, so it must never couple the wavelengths (or the thetas) that happen
+# to be evaluated together.  That is the property these tests pin down; it is
+# what makes the option usable at all inside the generators, which vmap over
+# sub-pixels and sources.
+
+
+def _ln_models(n_params=2, n_hidden_layers=2, hidden_size=8, seed=0):
+    """(without LN, with LN) built from the SAME key."""
+    kw = dict(n_params=n_params, n_hidden_layers=n_hidden_layers,
+              hidden_size=hidden_size, key=jax.random.PRNGKey(seed))
+    return NeuralNetSpectrum(**kw), NeuralNetSpectrum(layer_norm=True, **kw)
+
+
+def test_neural_net_layer_norm_is_optional_and_matches_the_hidden_layers():
+    """Off -> no modules; on -> one per activated layer, starting as identity."""
+    plain, normed = _ln_models()
+
+    assert plain.layer_norm is False
+    assert plain.norms == []
+
+    assert normed.layer_norm is True
+    # One per ACTIVATED layer, i.e. n_hidden_layers + 1, aligned with `film`.
+    assert len(normed.norms) == len(normed.film) == 3
+    for ln in normed.norms:
+        assert ln.weight.shape == (8,)
+        # eqx initialises the affine to the identity, so at this point the
+        # layer is a pure standardisation (and a trained model trains it).
+        np.testing.assert_allclose(np.asarray(ln.weight), 1.0)
+        np.testing.assert_allclose(np.asarray(ln.bias), 0.0)
+
+
+def test_neural_net_layer_norm_leaves_the_main_mlp_untouched():
+    """Turning it on must not change the MLP/FiLM weights for a given key.
+
+    The FiLM hyperparameters are a knob on the same random draw; the same must
+    hold for LayerNorm, so that toggling it does not silently re-randomise the
+    model (and so a saved fingerprint stays comparable).
+    """
+    plain, normed = _ln_models()
+
+    for a, b in zip(plain.layers, normed.layers):
+        np.testing.assert_array_equal(np.asarray(a.weight), np.asarray(b.weight))
+        np.testing.assert_array_equal(np.asarray(a.bias), np.asarray(b.bias))
+    for fa, fb in zip(plain.film, normed.film):
+        for la, lb in zip(fa.layers, fb.layers):
+            np.testing.assert_array_equal(np.asarray(la.weight),
+                                          np.asarray(lb.weight))
+
+
+def test_neural_net_layer_norm_changes_the_spectrum_but_keeps_the_contract():
+    """It acts on the spectrum, and the log-flux contract still holds."""
+    plain, normed = _ln_models()
+    lam = jnp.linspace(0.4, 5.0, 17)
+    theta = jnp.array([0.3, -0.2])
+
+    a = np.asarray(normalized_log_shape(plain, lam, theta))
+    b = np.asarray(normalized_log_shape(normed, lam, theta))
+    assert not np.allclose(a, b)
+
+    for model in (plain, normed):
+        # Anchored at LAMBDA_0 -> the amplitude keeps its meaning.
+        assert float(normalized_log_shape(
+            model, jnp.array([LAMBDA_0]), theta)[0]) == pytest.approx(0.0,
+                                                                     abs=1e-6)
+        shape = np.asarray(normalized_shape(model, lam, theta))
+        assert np.all(np.isfinite(shape)) and np.all(shape > 0.0)
+
+    # ...and gradients still flow to theta through the normalisations.
+    grad = jax.grad(lambda t: jnp.sum(normed(lam, t)))(theta)
+    assert grad.shape == (2,)
+    assert np.all(np.isfinite(np.asarray(grad)))
+
+
+def test_neural_net_layer_norm_is_call_time_deterministic():
+    """The value for one (theta, lambda) must not depend on the batch.
+
+    This is the requirement that rules out normalising over the wavelength
+    axis: a per-wavelength feature normalisation may only look at the feature
+    vector of the wavelength being evaluated.  Checked for both a reduced
+    wavelength grid and a batch of thetas.
+    """
+    _, normed = _ln_models()
+    lam = jnp.logspace(np.log10(0.75), np.log10(5.0), 32)
+    theta = jnp.array([0.3, -0.2])
+
+    full = np.asarray(normed(lam, theta))
+    subset = np.asarray(normed(lam[::5], theta))
+    np.testing.assert_allclose(subset, full[::5], rtol=1e-6, atol=1e-6)
+
+    thetas = jnp.stack([theta, theta + 1.0, theta - 1.0])
+    batched = np.asarray(jax.vmap(normed, in_axes=(None, 0))(lam, thetas))
+    one_by_one = np.asarray([np.asarray(normed(lam, t)) for t in thetas])
+    np.testing.assert_allclose(batched, one_by_one, rtol=1e-6, atol=1e-6)
+
+
+def test_neural_net_layer_norm_makes_a_random_net_less_flat():
+    """It has a large effect on the raw log-shape spread - that is its purpose.
+
+    A randomly initialised network is far too flat (the mock's output
+    rescaling exists for that reason); normalising each hidden layer makes the
+    spectrum vary several times more across the wavelength range.  The bound is
+    loose on purpose - this pins the *effect*, not a particular number.
+    """
+    lam = jnp.logspace(np.log10(0.75), np.log10(5.0), 128)
+    thetas = jax.random.normal(jax.random.PRNGKey(3), (32, 1))
+    plain, normed = _ln_models(n_params=1, n_hidden_layers=1, hidden_size=32,
+                               seed=314159)
+
+    def median_spread(model):
+        per_theta = jax.vmap(
+            lambda t: jnp.std(normalized_log_shape(model, lam, t))
+        )(thetas)
+        return float(jnp.median(per_theta))
+
+    without, with_ln = median_spread(plain), median_spread(normed)
+    assert np.isfinite(without) and np.isfinite(with_ln)
+    assert with_ln > 2.0 * without
+

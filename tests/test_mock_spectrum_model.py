@@ -402,6 +402,53 @@ def test_model_fingerprint_detects_change():
     assert mock._model_fingerprint(model) == before
 
 
+def test_layer_norm_is_passed_through_and_fingerprinted():
+    """The factory honours ``layer_norm``, and freezing covers its parameters.
+
+    The option is a per-wavelength feature normalisation (see
+    ``NeuralNetSpectrum``), so it must not change any other weight for a given
+    seed - only add its own, which the frozen-weights guarantee then covers.
+    """
+    plain = mock._build_spectrum_model(kind="nn", verbose=False)
+    normed = mock._build_spectrum_model(kind="nn", layer_norm=True,
+                                       verbose=False)
+
+    assert plain.layer_norm is False
+    assert normed.layer_norm is True
+    assert len(normed.norms) == len(normed.film)     # one per activated layer
+
+    lambdas = mock._wavelength_grid(16)
+    theta = jnp.zeros(normed.n_params)
+    assert normed(lambdas, theta).shape == (16,)
+    assert not np.allclose(np.asarray(normed(lambdas, theta)),
+                           np.asarray(plain(lambdas, theta)))
+
+    # Same key -> same weights, EXCEPT the output layer: turning the
+    # normalisation on changes the raw log-shape spread, so
+    # ``_rescale_nn_output`` deliberately re-tunes the output weight block to
+    # hit the same target spread.  Everything upstream is bit-identical.
+    for a, b in zip(plain.layers[:-1], normed.layers[:-1]):
+        np.testing.assert_array_equal(np.asarray(a.weight),
+                                      np.asarray(b.weight))
+    for fa, fb in zip(plain.film, normed.film):
+        for la, lb in zip(fa.layers, fb.layers):
+            np.testing.assert_array_equal(np.asarray(la.weight),
+                                          np.asarray(lb.weight))
+    assert not np.allclose(np.asarray(plain.layers[-1].weight),
+                           np.asarray(normed.layers[-1].weight))
+
+    # The affine parameters are leaves of the model, so a nudged one must show
+    # up in the fingerprint that proves nothing changed during inference.
+    before = mock._model_fingerprint(normed)
+    nudged = eqx.tree_at(
+        lambda m: m.norms[0].weight,
+        normed,
+        normed.norms[0].weight * 1.0001,
+    )
+    assert mock._model_fingerprint(nudged) != before
+    assert mock._model_fingerprint(normed) == before
+
+
 def test_neural_net_spectrum_is_a_valid_library_model():
     """The injected instance is a plain NeuralNetSpectrum (library contract)."""
     model = _small_nn(n_params=2)

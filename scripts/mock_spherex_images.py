@@ -131,9 +131,9 @@ N_LAMBDA = 1
 SPECTRUM_KIND = "nn"
 
 # Neural-network hyperparameters (only used if SPECTRUM_KIND = "nn")
-NN_N_PARAMS = 1
-NN_N_HIDDEN_LAYERS = 1
-NN_HIDDEN_SIZE = 32
+NN_N_PARAMS = 3
+NN_N_HIDDEN_LAYERS = 2
+NN_HIDDEN_SIZE = 16
 NN_SEED = 314159
 
 # FiLM conditioning: theta does not enter the network as an input feature, it
@@ -146,7 +146,17 @@ NN_SEED = 314159
 # theta"; raise it for more capacity.  NN_FILM_HIDDEN_LAYERS = 0 would make
 # each branch a single linear map instead of a small MLP.
 NN_FILM_HIDDEN_LAYERS = 1
-NN_FILM_SIZE_FACTOR = 1.0
+NN_FILM_SIZE_FACTOR = 2.0
+
+# Optional LayerNorm after the activation of every hidden layer (see
+# ``NeuralNetSpectrum``), normalising the features of ONE wavelength so it can
+# never couple the wavelengths or sources evaluated together.  It makes a
+# RANDOM network much less flat (raw per-source log-shape std 0.015 -> 0.10 at
+# the default 1x32, so the output rescaling needs ~33x instead of ~5x), but it
+# does not REMOVE that rescaling - the achieved spread still varies with the
+# seed.  Off by default so the recorded benchmark numbers keep their meaning;
+# flip it here or pass --nn-layer-norm.
+NN_LAYER_NORM = True
 
 # Fourier (positional) embedding of the wavelength: the input vector carries
 # ln(wavelength) plus sin/cos of NN_N_EMBEDDINGS geometrically spaced
@@ -294,6 +304,7 @@ def _build_spectrum_model(
     delta_ln_wavelength=NN_DELTA_LN_WAVELENGTH,
     film_hidden_layers=NN_FILM_HIDDEN_LAYERS,
     film_hidden_size_factor=NN_FILM_SIZE_FACTOR,
+    layer_norm=NN_LAYER_NORM,
     *,
     target_log_shape_std=NN_TARGET_LOG_SHAPE_STD,
     verbose=True,
@@ -318,6 +329,9 @@ def _build_spectrum_model(
         the width of those layers as a MULTIPLE of ``len(theta)`` (default
         1.0, i.e. as wide as ``theta``, so the theta path is never a narrower
         bottleneck than ``theta`` itself).
+    layer_norm : bool
+        Insert a per-wavelength LayerNorm after every hidden activation
+        (neural-network model only; default off).
     target_log_shape_std : float
         Target standard deviation of the ``LAMBDA_0``-normalised log-shape of a
         single source, over wavelength (median over draws from the prior).
@@ -346,6 +360,7 @@ def _build_spectrum_model(
         n_embeddings=n_embeddings, delta_ln_wavelength=delta_ln_wavelength,
         film_hidden_layers=film_hidden_layers,
         film_hidden_size_factor=film_hidden_size_factor,
+        layer_norm=layer_norm,
         key=jax.random.PRNGKey(seed),
     )
     model, factor = _rescale_nn_output(
@@ -356,6 +371,7 @@ def _build_spectrum_model(
               f"layers={n_hidden_layers}, hidden={hidden_size}, "
               f"film={film_hidden_layers}x{model.film_hidden_size} "
               f"(={film_hidden_size_factor:g}*P), "
+              f"ln={'on' if layer_norm else 'off'}, "
               f"embeddings={n_embeddings}/{delta_ln_wavelength:.3f}ln-lambda, "
               f"seed={seed}), random weights FROZEN")
         print(f"    output layer rescaled by {factor:.4g} to give a per-source "
@@ -1559,7 +1575,8 @@ def _spectrum_model_name(model=None):
         return "blackbody"
     return (f"neural net, P={model.n_params}, "
             f"{model.n_hidden_layers}x{model.hidden_size}, "
-            f"film {model.film_hidden_layers}x{model.film_hidden_size}")
+            f"film {model.film_hidden_layers}x{model.film_hidden_size}"
+            + (", +LN" if model.layer_norm else ""))
 
 
 def end_to_end_mock(use_lm=False, spectrum_model=None):
@@ -1762,7 +1779,7 @@ def end_to_end_mock(use_lm=False, spectrum_model=None):
             inf_exposures,
             init_log_params,
             n_steps=256,
-            learning_rate=1e-3,
+            learning_rate=1e-2,
             momentum=0.3,
             warmup_steps=16,
             n_lambda=N_LAMBDA,
@@ -2469,6 +2486,14 @@ if __name__ == "__main__":
                             "multiple of len(theta), so the theta path is "
                             "never a narrower bottleneck than theta "
                             "(default: %(default)s).")
+    parser.add_argument("--nn-layer-norm",
+                       action=argparse.BooleanOptionalAction,
+                       default=NN_LAYER_NORM,
+                       help="Insert a LayerNorm after every hidden activation "
+                            "(neural network only).  It normalises the "
+                            "features of one wavelength, so it cannot couple "
+                            "batched calls; it does NOT remove the need for "
+                            "the output rescaling (default: %(default)s).")
     parser.add_argument("--nn-shape-check", action="store_true",
                        help="Print/plot the spectrum-model shape and "
                             "identifiability diagnostic, then exit.")
@@ -2484,6 +2509,7 @@ if __name__ == "__main__":
         delta_ln_wavelength=args.nn_delta_ln_wavelength,
         film_hidden_layers=args.nn_film_layers,
         film_hidden_size_factor=args.nn_film_size_factor,
+        layer_norm=args.nn_layer_norm,
     )
     _set_spectrum_model(spectrum_model)
 
