@@ -75,12 +75,19 @@ def test_nn_factory_is_seed_deterministic():
     assert a != c
 
 
-def test_nn_rescale_hits_target_log_shape_std():
-    """The output rescaling must bring the in-band log-shape to O(1).
+def test_nn_rescale_targets_the_per_source_log_shape_std():
+    """The output rescaling must bring a TYPICAL source's spectrum to O(1).
 
-    The measured spread uses a DIFFERENT key from the one used for the
-    rescaling, so this is a genuine out-of-sample check of the target (a
-    finite-sample std over the rescaling draw would be exact but circular).
+    The statistic matched is the PER-SOURCE spread (the std over wavelength of
+    one drawn theta, median over draws), not the spread pooled over
+    (theta, wavelength): the pooled number also contains the spread between
+    sources, so a strongly theta-dependent model could hit it while every
+    individual spectrum stayed nearly flat - which is the failure the
+    rescaling exists to prevent.
+
+    The measurement uses a DIFFERENT key from the one used for the rescaling,
+    so this is a genuine out-of-sample check of the target (a finite-sample std
+    over the rescaling draw would be exact but circular).
     """
     model = _small_nn(seed=11)
     lambdas = mock._wavelength_grid(256)
@@ -89,10 +96,17 @@ def test_nn_rescale_hits_target_log_shape_std():
     log_shape = jax.vmap(
         lambda th: normalized_log_shape(model, lambdas, th)
     )(thetas)
-    measured = float(jnp.std(log_shape))
+    per_source = np.asarray(jnp.std(log_shape, axis=1))
 
-    assert np.isfinite(measured)
-    assert measured == pytest.approx(mock.NN_TARGET_LOG_SHAPE_STD, rel=0.5)
+    assert np.all(np.isfinite(np.asarray(log_shape)))
+    assert np.median(per_source) == pytest.approx(
+        mock.NN_TARGET_LOG_SHAPE_STD, rel=0.5)
+    # Only the RATIO is controlled by the rescaling, so the two statistics must
+    # be of the same order - if the pooled one ran away it would mean the
+    # rescaling had been hijacked by the spread BETWEEN sources.
+    pooled = float(jnp.std(log_shape))
+    assert pooled > 0.0
+    assert pooled < 4.0 * mock.NN_TARGET_LOG_SHAPE_STD
 
 
 def test_nn_shape_is_normalised_and_positive():
@@ -375,6 +389,16 @@ def test_model_fingerprint_detects_change():
     )
 
     assert mock._model_fingerprint(nudged) != before
+    assert mock._model_fingerprint(model) == before
+
+    # The FiLM branches are part of the same pytree, so they are fingerprinted
+    # too - freezing must cover them, not just the main MLP.
+    film_nudged = eqx.tree_at(
+        lambda m: m.film[0].layers[-1].weight,
+        model,
+        model.film[0].layers[-1].weight * 1.0001,
+    )
+    assert mock._model_fingerprint(film_nudged) != before
     assert mock._model_fingerprint(model) == before
 
 

@@ -295,14 +295,110 @@ class BlackbodySpectrum(eqx.Module):
         return -5.0 * jnp.log(wavelength) - jnp.log(jnp.expm1(exponent))
 
 
+# ---------------------------------------------------------------------------
+# FiLM conditioning
+# ---------------------------------------------------------------------------
+
+class FiLMLayer(eqx.Module):
+    """Feature-wise linear modulation of one hidden layer.
+
+    Maps a source's shape parameters ``theta`` to a per-neuron scale
+    ``gamma`` and offset ``beta`` for ONE hidden layer of
+    :class:`NeuralNetSpectrum`; that layer then computes
+    ``silu(gamma * (W h + b) + beta)``.  This is how ``theta`` reaches the
+    network at all - it is *not* concatenated to the wavelength features.
+
+    The branch is deliberately tiny, and its hidden width is tied to the size
+    of ``theta`` rather than being a fixed constant::
+
+        hidden width  W = max(round(film_hidden_size_factor * n_params), 1)
+
+    A fixed width would cap how much of ``theta`` can reach ``gamma``/``beta``:
+    with ``P`` shape parameters and a 4-unit hidden layer, the modulation could
+    only depend on 4 independent combinations of them, so the model would
+    behave as if ``theta`` were 4-dimensional however large ``P`` is.  With
+    ``film_hidden_size_factor = 1`` the branch is exactly as wide as ``theta``
+    (no compression at all); larger factors widen it.
+
+    Parameters
+    ----------
+    n_params : int
+        Size ``P`` of ``theta`` (the branch's input width).
+    film_hidden_layers : int
+        Number of hidden layers inside the branch.  ``0`` gives a single
+        linear map ``theta -> (gamma, beta)``.
+    film_hidden_size : int
+        Width ``W`` of those hidden layers (see the width rule above).
+    hidden_size : int
+        Width of the hidden layer being modulated; the branch outputs
+        ``2 * hidden_size`` numbers (a scale and an offset per neuron).
+    key : jax.Array
+        PRNG key for the branch's initialisation.
+
+    Notes
+    -----
+    The weights use plain random initialisation, like every other layer.  An
+    "identity at initialisation" scheme (``gamma = 1``, ``beta = 0``, i.e. a
+    zeroed output projection) is deliberately *not* used: with a linear output
+    projection it would make ``d gamma / d theta == 0`` for every ``theta``, so
+    the shape parameters would have no effect on the spectrum at all - fatal
+    for a model whose weights are frozen and whose entire purpose is that
+    ``theta`` selects the spectrum.
+    """
+
+    layers: list
+    n_params: int
+    film_hidden_layers: int
+    film_hidden_size: int
+    hidden_size: int
+
+    def __init__(
+        self,
+        n_params: int,
+        film_hidden_layers: int,
+        film_hidden_size: int,
+        hidden_size: int,
+        *,
+        key: jax.Array,
+    ):
+        self.n_params = n_params
+        self.film_hidden_layers = film_hidden_layers
+        self.film_hidden_size = film_hidden_size
+        self.hidden_size = hidden_size
+
+        # theta -> W -> ... -> W -> (gamma, beta).  With no hidden layers this
+        # collapses to a single Linear(n_params, 2 * hidden_size), so the
+        # factor simply does not apply.
+        dims = ([n_params] + [film_hidden_size] * film_hidden_layers
+                + [2 * hidden_size])
+        keys = jax.random.split(key, len(dims) - 1)
+        self.layers = [
+            eqx.nn.Linear(in_dim, out_dim, key=layer_key)
+            for in_dim, out_dim, layer_key in zip(dims[:-1], dims[1:], keys)
+        ]
+
+    def __call__(self, shape_params: jnp.ndarray):
+        """Map ``theta`` to ``(gamma, beta)``, both of shape ``(hidden_size,)``.
+
+        SiLU is applied between the branch's hidden layers only: the final
+        projection is left linear, so ``(gamma, beta)`` are an affine function
+        of the last hidden features.
+        """
+        x = shape_params
+        for layer in self.layers[:-1]:
+            x = jax.nn.silu(layer(x))
+        gamma, beta = jnp.split(self.layers[-1](x), 2)
+        return gamma, beta
+
+
 class NeuralNetSpectrum(eqx.Module):
     """Neural-network spectrum template (unnormalised log-flux).
 
-    A flexible alternative to :class:`BlackbodySpectrum`.  A small MLP maps
-    ``(wavelength, shape_params)`` to a log-flux, and ``__call__`` returns it
-    directly::
+    A flexible alternative to :class:`BlackbodySpectrum`.  A small MLP maps the
+    wavelength to a log-flux, with the shape parameters entering through FiLM
+    modulation of every hidden layer, and ``__call__`` returns it directly::
 
-        log_kernel(lambda) = NN(lambda, theta)
+        log_kernel(lambda) = NN(lambda; theta)
 
     Like the blackbody, this is defined only up to a wavelength-independent
     offset: the caller normalises it by subtracting ``NN(LAMBDA_0, theta)``
@@ -348,6 +444,32 @@ class NeuralNetSpectrum(eqx.Module):
     the embedding costs ``2 * n_embeddings`` transcendentals per call, which is
     comparable to the arithmetic of a small MLP.
 
+    How ``theta`` enters (FiLM modulation)
+    --------------------------------------
+    ``theta`` is **not** concatenated to the wavelength features.  Instead,
+    every hidden layer has its own :class:`FiLMLayer` - a small MLP mapping
+    ``theta`` to a per-neuron scale and offset::
+
+        z_l         = W_l h_{l-1} + b_l
+        gamma, beta = FiLM_l(theta)
+        h_l         = silu(gamma * z_l + beta)
+
+    so ``theta`` modulates the hidden features multiplicatively (and shifts
+    them) instead of entering as one more input feature alongside the
+    wavelength.  Two properties are worth keeping in mind:
+
+    * The branch's hidden width scales with ``theta``
+      (``film_hidden_size_factor * n_params``, see :class:`FiLMLayer`), so a
+      large ``P`` is never squeezed through a fixed narrow bottleneck.
+    * ``(gamma, beta)`` are wavelength-independent, so they are computed ONCE
+      per call and broadcast over the wavelength axis (see :meth:`__call__`):
+      the branches add no per-wavelength cost.
+
+    There is one branch per *activated* layer, i.e. ``n_hidden_layers + 1`` of
+    them, because the input projection is itself a hidden layer.  That also
+    means ``theta`` is never ignored, even at ``n_hidden_layers = 0``, where
+    the input projection's branch would be its only route into the network.
+
     Batching convention
     -------------------
     ``__call__`` handles the wavelengths of a SINGLE source::
@@ -364,12 +486,13 @@ class NeuralNetSpectrum(eqx.Module):
     ``lax.scan``/``lax.map`` over sources), so the model must not try to batch
     those axes itself.
 
-    Internally the MLP is evaluated one wavelength at a time and vectorised
-    with ``jax.vmap``.  That keeps the network definition simple: an MLP layer
-    expects the feature axis last, so ``concatenate([lambda, theta])`` is only
-    well defined for a single wavelength (a wavelength *vector* would be read
-    as extra features).  To batch over sources as well, compose a second
-    ``vmap`` at the call site::
+    Internally the network is evaluated one wavelength at a time and vectorised
+    with ``jax.vmap``.  That keeps the network definition simple: a layer
+    expects the feature axis last, so the scalar wavelength embedding is the
+    natural core of the computation.  The FiLM parameters are computed once for
+    the whole source (they do not depend on wavelength) and passed to the
+    vmapped core, so no branch is re-evaluated per wavelength.  To batch over
+    sources as well, compose a second ``vmap`` at the call site::
 
         jax.vmap(model, in_axes=(None, 0))(wavelengths, shape_params_batch)
 
@@ -386,11 +509,19 @@ class NeuralNetSpectrum(eqx.Module):
     n_embeddings : int, optional
         Number of Fourier frequencies used to embed the wavelength (default
         8, i.e. 1 + 16 input features from the wavelength).  Set to 0 to feed
-        ``ln(lambda)`` only.
-    delta_ln_wavelength : float, optional
+        ``ln(lambda)`` only.    delta_ln_wavelength : float, optional
         Span of the embedding in log-wavelength, i.e. the range of
         ``ln(lambda)`` the Fourier features should cover (default
         ``ln(5.0 / 0.75)``, the full 0.75 - 5.0 um SPHEREx range).
+    film_hidden_layers : int, optional
+        Hidden layers inside each FiLM branch (default 1).  ``0`` makes every
+        branch a single linear map from ``theta`` to ``(gamma, beta)``.
+    film_hidden_size_factor : float, optional
+        Width of each FiLM branch's hidden layers, as a multiple of the number
+        of shape parameters: ``W = max(round(factor * n_params), 1)``.  The
+        default 1.0 makes the branch exactly as wide as ``theta`` itself, so
+        the modulation is never a narrower bottleneck than ``theta``; raise it
+        to give the branches more capacity.  Must be positive.
     key : jax.Array
         PRNG key used to initialise the layers (``eqx.nn.Linear`` requires
         one).
@@ -401,7 +532,23 @@ class NeuralNetSpectrum(eqx.Module):
       sub-pixel of every source, and an MLP costs far more per point than the
       analytic blackbody, so this model noticeably slows the forward model
       (and each interleaved amplitude solve, which rebuilds the stamps).  Keep
-      ``hidden_size`` modest.
+      ``hidden_size`` modest.  The FiLM branches are cheap by comparison, and
+      they are evaluated once per call rather than once per wavelength sample.
+      Measured on image generation alone (band 3, 57 sources, 128^2 detector,
+      ``n_lambda = 1``, steady state): 146 ms for the blackbody, 199 ms (+36%)
+      for this model with ``n_embeddings = 0`` and 202 ms (+38%) with 8.
+    * **Branch widths.**  Each FiLM branch is ``P -> W -> (2 * H)`` with
+      ``W = max(round(film_hidden_size_factor * P), 1)``, so its arithmetic
+      grows like ``W * (P + 2 * H)``: linearly in ``hidden_size`` and
+      quadratically in ``P`` (at the default factor 1).
+    * **``theta`` has no guaranteed null direction, but it can still lose its
+      effect.**  If every ``gamma`` ended up near zero, the hidden layers would
+      stop depending on the wavelength and the shape would collapse to a
+      constant regardless of ``theta``.  Random initialisation makes that
+      unlikely, and the mock's output rescaling (see
+      ``scripts/mock_spherex_images.py``) turns it into a conspicuous huge
+      rescaling factor, but it is the failure mode to look for if the recovered
+      ``theta`` scatters wildly.
     * **No ``exp``, no ``LAMBDA_0`` here.**  The caller subtracts the value at
       ``LAMBDA_0`` and exponentiates afterwards.  Keeping both outside the
       model is what makes a random network safe: its raw offset is
@@ -418,17 +565,25 @@ class NeuralNetSpectrum(eqx.Module):
       a SPHEREx bandpass is also a constant fraction of its central wavelength
       (``sigma / lambda_c = 1 / (2.355 R)``), the shape now varies with roughly
       the same relative richness in every band, and more so in the
-      low-resolution bands.  Measured forward-model error (band 3, relative
-      RMS of ``n_lambda = 1`` against ``63``): ~1e-6 with ``n_embeddings = 0``,
-      ~1e-5 at 2, ~1e-4 at 4 and ~4e-3 (worst pixels ~10%) at 8.  Check
+      low-resolution bands.  Measured forward-model error (band 3, relative RMS
+      of ``n_lambda = 1`` against ``63``, normalized by the image's L2 norm):
+      ~1e-6 with ``n_embeddings = 0``, ~6e-6 at 2, ~3e-5 at 4 and ~2e-3 at 8,
+      the last being a 28% error in total flux - against ~5e-6 (0%) for a
+      3-8 kK blackbody.  Routing ``theta`` through FiLM does not change these
+      materially: the modulation changes how strongly the shape bends, not
+      which *frequencies* the embedding can express.  Check
       ``--compare-n-lambda`` after changing this model, and either reduce
       ``n_embeddings`` or raise ``n_lambda`` if the residuals are large.
     """
 
     layers: list
+    film: list
     n_params: int
     n_hidden_layers: int
     hidden_size: int
+    film_hidden_layers: int
+    film_hidden_size_factor: float
+    film_hidden_size: int
     n_embeddings: int
     delta_ln_wavelength: float
     frequencies: jnp.ndarray
@@ -440,6 +595,8 @@ class NeuralNetSpectrum(eqx.Module):
         hidden_size: int,
         n_embeddings: int = 8,
         delta_ln_wavelength: float = DEFAULT_DELTA_LN_WAVELENGTH,
+        film_hidden_layers: int = 1,
+        film_hidden_size_factor: float = 1.0,
         *,
         key: jax.Array,
     ):
@@ -460,6 +617,11 @@ class NeuralNetSpectrum(eqx.Module):
         delta_ln_wavelength : float, optional
             Span of the Fourier embedding in log-wavelength (default:
             ``ln(5.0 / 0.75)``, the full 0.75 - 5.0 um range).
+        film_hidden_layers : int, optional
+            Hidden layers inside each FiLM branch (default: 1).
+        film_hidden_size_factor : float, optional
+            Width of each FiLM branch's hidden layers relative to ``theta``
+            (default: 1.0, i.e. as wide as ``theta`` itself).
         key : jax.Array
             PRNG key for layer initialisation.
         """
@@ -468,6 +630,20 @@ class NeuralNetSpectrum(eqx.Module):
         self.hidden_size = hidden_size
         self.n_embeddings = n_embeddings
         self.delta_ln_wavelength = delta_ln_wavelength
+        self.film_hidden_layers = film_hidden_layers
+        self.film_hidden_size_factor = float(film_hidden_size_factor)
+        if self.film_hidden_size_factor <= 0.0:
+            raise ValueError(
+                "film_hidden_size_factor must be positive, got "
+                f"{film_hidden_size_factor!r}"
+            )
+
+        # FiLM branch width: a MULTIPLE of theta's size, so the modulation can
+        # never be a narrower bottleneck than theta itself (see FiLMLayer).
+        # Floored at 1 so a small factor cannot produce an empty layer.
+        self.film_hidden_size = max(
+            int(round(self.film_hidden_size_factor * n_params)), 1
+        )
 
         # Fourier feature frequencies k_i = 2^i * pi / delta_ln_wavelength, so
         # the i-th feature completes 2^(i-1) cycles across
@@ -482,9 +658,12 @@ class NeuralNetSpectrum(eqx.Module):
         )
 
         # One key per Linear layer: input -> hidden, hidden -> hidden (x N),
-        # hidden -> 1.
-        keys = jax.random.split(key, n_hidden_layers + 2)
-        input_size = n_params + 1 + 2 * n_embeddings
+        # hidden -> 1.  The FiLM branches are initialised from an independent
+        # subkey, so that adding or resizing them cannot change the main MLP's
+        # weights for a given seed.
+        key_main, key_film = jax.random.split(key)
+        keys = jax.random.split(key_main, n_hidden_layers + 2)
+        input_size = 1 + 2 * n_embeddings      # theta is NOT an input
         layers = [eqx.nn.Linear(input_size, hidden_size, key=keys[0])]
         for i in range(n_hidden_layers):
             layers.append(
@@ -492,6 +671,19 @@ class NeuralNetSpectrum(eqx.Module):
             )
         layers.append(eqx.nn.Linear(hidden_size, 1, key=keys[-1]))
         self.layers = layers
+
+        # One FiLM branch per ACTIVATED layer, i.e. len(layers) - 1 of them:
+        # `self.film[i]` modulates `self.layers[i]`.  The input projection is
+        # itself a hidden layer, so with n_hidden_layers = 0 there is still one
+        # branch and theta is never ignored.
+        film_keys = jax.random.split(key_film, len(layers) - 1)
+        self.film = [
+            FiLMLayer(
+                n_params, film_hidden_layers, self.film_hidden_size,
+                hidden_size, key=film_keys[i],
+            )
+            for i in range(len(layers) - 1)
+        ]
 
     def _embed_wavelength(self, wavelength: jnp.ndarray) -> jnp.ndarray:
         """Fourier (positional) embedding of ONE wavelength.
@@ -532,6 +724,41 @@ class NeuralNetSpectrum(eqx.Module):
             [ln_wl, jnp.sin(angles), jnp.cos(angles)], axis=-1
         )                                            # (1 + 2 n_embeddings,)
 
+    def _film_params(self, shape_params: jnp.ndarray) -> list:
+        """``(gamma, beta)`` for every activated layer, from ``theta``.
+
+        Depends only on the shape parameters - never on wavelength - so
+        :meth:`__call__` evaluates this ONCE and reuses the result for every
+        wavelength sample, instead of recomputing the branches inside the
+        per-wavelength ``vmap``.
+
+        Returns
+        -------
+        list of (jnp.ndarray, jnp.ndarray)
+            One ``(gamma, beta)`` pair per activated layer, aligned with
+            ``self.layers[:-1]``; each array has shape ``(hidden_size,)``.
+        """
+        return [branch(shape_params) for branch in self.film]
+
+    def _forward(
+        self,
+        wavelength_features: jnp.ndarray,
+        film_params: list,
+    ) -> jnp.ndarray:
+        """Log-flux kernel for ONE wavelength of ONE source.
+
+        ``wavelength_features`` is an embedded wavelength (see
+        :meth:`_embed_wavelength`) and ``film_params`` the pairs returned by
+        :meth:`_film_params`.  Passing them in rather than recomputing keeps
+        this a pure function of ``(features, film)``, which is what lets
+        :meth:`__call__` ``vmap`` over wavelengths without re-running the FiLM
+        branches each time.
+        """
+        x = wavelength_features
+        for layer, (gamma, beta) in zip(self.layers[:-1], film_params):
+            x = jax.nn.silu(gamma * layer(x) + beta)
+        return jnp.squeeze(self.layers[-1](x), axis=-1)
+
     def raw_neural_net(
         self,
         wavelength: jnp.ndarray,
@@ -541,15 +768,15 @@ class NeuralNetSpectrum(eqx.Module):
 
         ``wavelength`` is a scalar and ``shape_params`` a ``(n_params,)``
         vector; the result is a scalar log-flux, which is what ``__call__``
-        returns per wavelength.
+        returns per wavelength.  This is the self-contained scalar path (it
+        computes its own FiLM parameters); :meth:`__call__` instead computes
+        them once for the whole wavelength vector and calls :meth:`_forward`.
+        The two agree exactly.
         """
-        wl_features = self._embed_wavelength(wavelength)
-        x = jnp.concatenate(
-            [wl_features, shape_params], axis=-1
+        return self._forward(
+            self._embed_wavelength(wavelength),
+            self._film_params(shape_params),
         )
-        for layer in self.layers[:-1]:
-            x = jax.nn.silu(layer(x))
-        return jnp.squeeze(self.layers[-1](x), axis=-1)
 
     def __call__(
         self,
@@ -577,7 +804,12 @@ class NeuralNetSpectrum(eqx.Module):
         """
         wavelength = jnp.atleast_1d(wavelength)   # (N_lambda,)
 
-        # The network consumes a single feature vector, so map over wavelengths.
-        return jax.vmap(self.raw_neural_net, in_axes=(0, None))(
-            wavelength, shape_params
+        # theta -> (gamma, beta) once per call: the FiLM parameters are
+        # wavelength-independent, so they must not be recomputed inside the
+        # per-wavelength vmap (``in_axes=None`` broadcasts the nested pytree
+        # of (gamma, beta) pairs over the wavelength axis).
+        film_params = self._film_params(shape_params)
+        features = jax.vmap(self._embed_wavelength)(wavelength)
+        return jax.vmap(self._forward, in_axes=(0, None))(
+            features, film_params
         )

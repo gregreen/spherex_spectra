@@ -402,3 +402,166 @@ def test_neural_net_offset_invariance(nn):
     shifted = normalized_shape(_OffsetSpectrum(nn, 41.0), lam, theta)
     np.testing.assert_allclose(shifted, reference, rtol=1e-5)
 
+
+# ---------------------------------------------------------------------------
+# NeuralNetSpectrum: FiLM conditioning of theta
+# ---------------------------------------------------------------------------
+#
+# theta is not an input feature: it modulates every hidden layer through a
+# FiLM branch (theta -> gamma, beta), applied BEFORE the nonlinearity.  These
+# tests pin down that wiring, because the mock FROZEN weights make it the only
+# route for theta into the model.
+
+
+def test_neural_net_theta_is_not_an_input_feature():
+    """The network input is the embedded wavelength alone - no theta."""
+    model = NeuralNetSpectrum(
+        n_params=3, n_hidden_layers=1, hidden_size=8, n_embeddings=4,
+        key=jax.random.PRNGKey(0),
+    )
+    assert model.layers[0].in_features == 1 + 2 * 4
+
+    # ...and theta still changes the spectrum, via the FiLM branches.
+    lam = jnp.linspace(0.4, 5.0, 9)
+    a = normalized_log_shape(model, lam, jnp.zeros(3))
+    b = normalized_log_shape(model, lam, jnp.array([1.0, 0.0, 0.0]))
+    assert not np.allclose(np.asarray(a), np.asarray(b))
+
+
+def test_neural_net_has_one_film_branch_per_activated_layer():
+    """len(film) == n_hidden_layers + 1 (the input projection is a layer too)."""
+    model = NeuralNetSpectrum(
+        n_params=2, n_hidden_layers=2, hidden_size=8,
+        key=jax.random.PRNGKey(0),
+    )
+    assert len(model.film) == 3
+    assert len(model.layers) == 4
+
+    for branch in model.film:
+        gamma, beta = branch(jnp.array([0.5, -0.5]))
+        assert gamma.shape == (8,)
+        assert beta.shape == (8,)
+        # Linear output projection: the branch is an affine function of its
+        # last hidden features, so translating theta shifts (gamma, beta)
+        # linearly at most - checked here as finite/nonzero rather than exact.
+        assert np.all(np.isfinite(np.asarray(gamma)))
+        assert np.all(np.isfinite(np.asarray(beta)))
+
+
+def test_neural_net_theta_jacobian_is_nonzero_at_zero():
+    """theta must move the shape even at theta = 0.
+
+    Guards against "identity at initialisation" FiLM (gamma = 1, beta = 0):
+    with a linear output projection that makes d gamma / d theta == 0
+    everywhere, leaving theta with no effect on a model whose weights are
+    frozen.  LAMBDA_0 is excluded because the normalised shape is identically
+    zero there, so its gradient is zero by construction.
+    """
+    model = NeuralNetSpectrum(
+        n_params=2, n_hidden_layers=1, hidden_size=8,
+        key=jax.random.PRNGKey(0),
+    )
+    lam = jnp.linspace(0.4, 5.0, 16)
+
+    jac = jax.jacfwd(
+        lambda th: normalized_log_shape(model, lam, th)
+    )(jnp.zeros(2))
+    jac = np.asarray(jac)
+
+    assert np.all(np.isfinite(jac))
+    assert np.any(np.abs(jac) > 1e-8)
+
+
+def test_neural_net_raw_and_call_agree():
+    """The scalar core and the batched path must give identical numbers.
+
+    ``__call__`` computes the FiLM parameters once for the whole wavelength
+    vector, ``raw_neural_net`` recomputes them per wavelength; the two must not
+    drift apart.
+    """
+    model = NeuralNetSpectrum(
+        n_params=2, n_hidden_layers=2, hidden_size=8,
+        key=jax.random.PRNGKey(1),
+    )
+    lam = jnp.linspace(0.4, 5.0, 7)
+    theta = jnp.array([0.3, -0.2])
+
+    batched = np.asarray(model(lam, theta))
+    scalar = np.asarray(
+        jax.vmap(model.raw_neural_net, in_axes=(0, None))(lam, theta)
+    )
+    np.testing.assert_allclose(batched, scalar, rtol=1e-6)
+
+
+@pytest.mark.parametrize("n_params,factor,expected", [
+    (1, 1.0, 1),
+    (3, 1.0, 3),
+    (3, 2.0, 6),
+    (5, 0.5, 2),          # rounded, and never allowed to reach 0
+    (1, 0.1, 1),          # a tiny factor is floored at 1
+])
+def test_neural_net_film_width_is_a_multiple_of_theta(n_params, factor,
+                                                      expected):
+    """The FiLM hidden width scales with theta, so it cannot bottleneck theta.
+
+    A fixed width would cap the modulation at that many combinations of the
+    shape parameters however large P is.
+    """
+    model = NeuralNetSpectrum(
+        n_params=n_params, n_hidden_layers=1, hidden_size=8,
+        film_hidden_size_factor=factor, key=jax.random.PRNGKey(0),
+    )
+    assert model.film_hidden_size == expected
+
+    # eqx.nn.Linear stores weight as (out_features, in_features).
+    shapes = [layer.weight.shape for layer in model.film[0].layers]
+    assert shapes == [(expected, n_params), (2 * 8, expected)]
+
+
+def test_neural_net_film_depth_is_configurable():
+    """film_hidden_layers = 0 gives one linear map; more gives a deeper MLP."""
+    flat = NeuralNetSpectrum(
+        n_params=2, n_hidden_layers=1, hidden_size=8, film_hidden_layers=0,
+        key=jax.random.PRNGKey(0),
+    )
+    assert [l.weight.shape for l in flat.film[0].layers] == [(16, 2)]
+
+    deeper = NeuralNetSpectrum(
+        n_params=2, n_hidden_layers=1, hidden_size=8, film_hidden_layers=2,
+        film_hidden_size_factor=2.0, key=jax.random.PRNGKey(0),
+    )
+    assert [l.weight.shape for l in deeper.film[0].layers] == [
+        (4, 2), (4, 4), (16, 4)
+    ]
+    # ...and it is still differentiable w.r.t. theta.
+    grad = jax.grad(
+        lambda th: jnp.sum(deeper(jnp.linspace(0.4, 5.0, 5), th))
+    )(jnp.array([0.1, -0.1]))
+    assert grad.shape == (2,)
+    assert np.all(np.isfinite(np.asarray(grad)))
+
+
+def test_neural_net_rejects_nonpositive_film_size_factor():
+    """A non-positive factor would empty the branch, so it is an error."""
+    for factor in (0.0, -1.0):
+        with pytest.raises(ValueError):
+            NeuralNetSpectrum(
+                n_params=2, n_hidden_layers=1, hidden_size=8,
+                film_hidden_size_factor=factor, key=jax.random.PRNGKey(0),
+            )
+
+
+def test_neural_net_without_hidden_layers_still_reacts_to_theta():
+    """With n_hidden_layers = 0 the input projection's branch is theta's only
+    route into the network, so it must exist and must matter."""
+    model = NeuralNetSpectrum(
+        n_params=2, n_hidden_layers=0, hidden_size=8,
+        key=jax.random.PRNGKey(0),
+    )
+    assert len(model.film) == 1
+
+    lam = jnp.linspace(0.4, 5.0, 9)
+    a = np.asarray(normalized_log_shape(model, lam, jnp.zeros(2)))
+    b = np.asarray(normalized_log_shape(model, lam, jnp.array([1.0, 1.0])))
+    assert np.max(np.abs(a - b)) > 1e-6
+

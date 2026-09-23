@@ -136,6 +136,18 @@ NN_N_HIDDEN_LAYERS = 1
 NN_HIDDEN_SIZE = 32
 NN_SEED = 314159
 
+# FiLM conditioning: theta does not enter the network as an input feature, it
+# modulates every hidden layer through a small branch that maps it to a
+# per-neuron scale and offset.  The branch's hidden width is a MULTIPLE of the
+# size of theta (NN_FILM_SIZE_FACTOR * P), so the theta path can never be a
+# narrower bottleneck than theta itself: a fixed width would make the
+# modulation depend on only that many combinations of the shape parameters
+# however large P is.  NN_FILM_SIZE_FACTOR = 1.0 therefore means "as wide as
+# theta"; raise it for more capacity.  NN_FILM_HIDDEN_LAYERS = 0 would make
+# each branch a single linear map instead of a small MLP.
+NN_FILM_HIDDEN_LAYERS = 1
+NN_FILM_SIZE_FACTOR = 1.0
+
 # Fourier (positional) embedding of the wavelength: the input vector carries
 # ln(wavelength) plus sin/cos of NN_N_EMBEDDINGS geometrically spaced
 # frequencies covering NN_DELTA_LN_WAVELENGTH e-foldings of wavelength.  Log
@@ -148,12 +160,14 @@ NN_SEED = 314159
 NN_N_EMBEDDINGS = 8
 NN_DELTA_LN_WAVELENGTH = np.log(5.0 / 0.75)   # full 0.75 - 5.0 um range
 
-# The randomly initialised network is rescaled so that its in-band
-# LAMBDA_0-normalised log-shape has roughly this standard deviation over the
-# prior, i.e. |log shape| ~ 1-2 out to 2-4 sigma.  Without this the frozen
-# random net could produce spectra spanning many decades, which would move the
-# amplitude range / background / detection S/N regime away from the blackbody
-# run that the amplitudes were chosen for.
+# The randomly initialised network is rescaled so that the LAMBDA_0-normalised
+# log-shape of a TYPICAL SOURCE has roughly this standard deviation over
+# wavelength, i.e. |log shape| ~ 1-2 out to 2-4 sigma across the spectrum.
+# Without this the frozen random net could produce spectra spanning many
+# decades, which would move the amplitude range / background / detection S/N
+# regime away from the blackbody run that the amplitudes were chosen for.
+# Note this is a PER-SOURCE statistic: reaching the same number through the
+# spread BETWEEN sources would leave every individual spectrum nearly flat.
 NN_TARGET_LOG_SHAPE_STD = 0.5
 NN_RESCALE_SAMPLES = 64
 
@@ -226,9 +240,22 @@ def _rescale_nn_output(model, key, target_std=NN_TARGET_LOG_SHAPE_STD,
     log-shape's spread over the full wavelength range, and scale the weight
     block to hit ``target_std``.
 
+    The quantity matched to ``target_std`` is the **per-source** spread: for
+    each drawn theta, the standard deviation of that source's log-shape over
+    wavelength, and then the median over draws.  That is what sets a source's
+    in-band shape, the information content of its multi-band photometry, and
+    hence the detection regime the amplitudes and background were chosen for.
+    The spread *pooled* over (theta, wavelength) is deliberately NOT the
+    target: it also contains the spread BETWEEN sources, which is a property of
+    the prior, and for a strongly theta-dependent model it can dominate - so a
+    run could hit the pooled target while every individual spectrum stayed
+    nearly flat, which is exactly the failure the rescaling exists to prevent.
+
     This keeps a *randomly initialised* network in the same dynamic range as
     the blackbody it replaces, so the directly-specified amplitude range, the
     background level and the resulting detection S/N all stay meaningful.
+    Whether ``target_std`` is itself the right number can be judged from
+    ``nn_shape_check``, which reports the same statistic for a blackbody.
 
     Returns
     -------
@@ -242,7 +269,8 @@ def _rescale_nn_output(model, key, target_std=NN_TARGET_LOG_SHAPE_STD,
     log_shape = jax.vmap(
         lambda theta: normalized_log_shape(model, lambdas, theta)
     )(thetas)                                         # (n_samples, n_lambda)
-    current = float(jnp.std(log_shape))
+    per_source = jnp.std(log_shape, axis=1)            # (n_samples,)
+    current = float(jnp.median(per_source))
     if not np.isfinite(current) or current <= 0.0:
         return model, 1.0
 
@@ -264,6 +292,8 @@ def _build_spectrum_model(
     seed=NN_SEED,
     n_embeddings=NN_N_EMBEDDINGS,
     delta_ln_wavelength=NN_DELTA_LN_WAVELENGTH,
+    film_hidden_layers=NN_FILM_HIDDEN_LAYERS,
+    film_hidden_size_factor=NN_FILM_SIZE_FACTOR,
     *,
     target_log_shape_std=NN_TARGET_LOG_SHAPE_STD,
     verbose=True,
@@ -282,8 +312,15 @@ def _build_spectrum_model(
     n_embeddings, delta_ln_wavelength : int, float
         Wavelength Fourier-embedding hyperparameters in log-wavelength space
         (neural-network model only; see ``spherex.spectrum.NeuralNetSpectrum``).
+    film_hidden_layers, film_hidden_size_factor : int, float
+        FiLM-conditioning hyperparameters (neural-network model only): the
+        number of hidden layers inside each per-hidden-layer FiLM branch, and
+        the width of those layers as a MULTIPLE of ``len(theta)`` (default
+        1.0, i.e. as wide as ``theta``, so the theta path is never a narrower
+        bottleneck than ``theta`` itself).
     target_log_shape_std : float
-        Target standard deviation of the ``LAMBDA_0``-normalised log-shape.
+        Target standard deviation of the ``LAMBDA_0``-normalised log-shape of a
+        single source, over wavelength (median over draws from the prior).
 
     Returns
     -------
@@ -307,6 +344,8 @@ def _build_spectrum_model(
     model = NeuralNetSpectrum(
         n_params, n_hidden_layers, hidden_size,
         n_embeddings=n_embeddings, delta_ln_wavelength=delta_ln_wavelength,
+        film_hidden_layers=film_hidden_layers,
+        film_hidden_size_factor=film_hidden_size_factor,
         key=jax.random.PRNGKey(seed),
     )
     model, factor = _rescale_nn_output(
@@ -315,9 +354,11 @@ def _build_spectrum_model(
     if verbose:
         print(f"  Spectrum model: NeuralNetSpectrum(P={n_params}, "
               f"layers={n_hidden_layers}, hidden={hidden_size}, "
+              f"film={film_hidden_layers}x{model.film_hidden_size} "
+              f"(={film_hidden_size_factor:g}*P), "
               f"embeddings={n_embeddings}/{delta_ln_wavelength:.3f}ln-lambda, "
               f"seed={seed}), random weights FROZEN")
-        print(f"    output layer rescaled by {factor:.4g} to give an in-band "
+        print(f"    output layer rescaled by {factor:.4g} to give a per-source "
               f"log-shape std of ~{target_log_shape_std:g}")
     return model
 
@@ -1517,7 +1558,8 @@ def _spectrum_model_name(model=None):
     if _is_blackbody(model):
         return "blackbody"
     return (f"neural net, P={model.n_params}, "
-            f"{model.n_hidden_layers}x{model.hidden_size}")
+            f"{model.n_hidden_layers}x{model.hidden_size}, "
+            f"film {model.film_hidden_layers}x{model.film_hidden_size}")
 
 
 def end_to_end_mock(use_lm=False, spectrum_model=None):
@@ -2182,8 +2224,65 @@ def run_benchmark(n_repeats=5, source_batch_sizes=(None, 8, 32),
 # Spectrum-model pre-flight check (not a formal test)
 # ---------------------------------------------------------------------------
 
+def _log_shape_spread(model, n_samples=64, n_points=512, seed=0):
+    """Per-source and pooled spread of a model's normalised log-shape.
+
+    ``per_source`` is the standard deviation of ONE source's log-shape over
+    wavelength (the quantity :func:`_rescale_nn_output` targets, and the one
+    that sets the in-band shape of a single source); ``pooled`` is the standard
+    deviation over the whole ``(theta, wavelength)`` array, which additionally
+    contains the spread BETWEEN sources.  Comparing the two says how much of a
+    model's variety is per-source rather than between sources.
+
+    Parameters
+    ----------
+    model : equinox.Module
+        Any spectrum model; theta is drawn from ITS prior (see
+        :func:`_draw_shape_params`), so a blackbody is drawn over log T.
+    n_samples, n_points : int
+    seed : int
+
+    Returns
+    -------
+    dict
+        ``per_source_median``/``per_source_lo``/``per_source_hi`` (median and
+        5-95 percentiles over draws), ``pooled``, and ``in_band_median`` (the
+        median over draws AND bands of the log-shape std *within* a bandpass).
+        The in-band number is the one that sets how much a single band's flux
+        can differ from the source's flux density at LAMBDA_0, and how fast the
+        shape varies across a bandpass (the quadrature caveat in
+        ``spherex.spectrum``).
+    """
+    lambdas = _wavelength_grid(n_points)
+    lam_np = np.asarray(lambdas)
+    rng = np.random.default_rng(seed)
+    theta = jnp.asarray(
+        _draw_shape_params(rng, n_samples, model), dtype=jnp.float32
+    )
+    log_shape = np.asarray(jax.vmap(
+        lambda th: normalized_log_shape(model, lambdas, th)
+    )(theta))
+    per_source = log_shape.std(axis=1)
+
+    in_band = []
+    for band in sorted(_BANDS):
+        lo, hi, _r, _name = _BANDS[band]
+        inside = (lam_np >= lo) & (lam_np <= hi)
+        if np.any(inside):
+            in_band.append(log_shape[:, inside].std(axis=1))
+
+    return {
+        "per_source_median": float(np.median(per_source)),
+        "per_source_lo": float(np.percentile(per_source, 5)),
+        "per_source_hi": float(np.percentile(per_source, 95)),
+        "pooled": float(log_shape.std()),
+        "in_band_median": (float(np.median(np.concatenate(in_band)))
+                           if in_band else float("nan")),
+    }
+
+
 def nn_shape_check(model=None, n_samples=64, n_points=400, seed=NN_SEED + 2,
-                   fname=os.path.join(PLOTS_DIR, "shape_check.svg")):
+                   fname=None):
     """Pre-flight diagnostic for the active spectrum model.
 
     Answers the questions that decide whether an inference run with this model
@@ -2199,7 +2298,8 @@ def nn_shape_check(model=None, n_samples=64, n_points=400, seed=NN_SEED + 2,
        decades moves the amplitude range / background / detection S/N regime
        away from the blackbody run the amplitudes were chosen for.  Reported as
        the per-band log-shape dynamic range over ``theta`` drawn from the
-       prior.
+       prior, plus the per-source vs pooled log-shape spread (with a blackbody
+       reference row) that the output rescaling is calibrated against.
 
     Also plots ``shape(lambda; theta)`` over the full SPHEREx wavelength range
     and prints the implied photon counts for the directly specified amplitude
@@ -2208,6 +2308,8 @@ def nn_shape_check(model=None, n_samples=64, n_points=400, seed=NN_SEED + 2,
     model = _set_spectrum_model(
         _build_spectrum_model() if model is None else model
     )
+    fname = (os.path.join(PLOTS_DIR, "shape_check.svg")
+             if fname is None else fname)
 
     print("=" * 60)
     print("Spectrum-model shape check")
@@ -2246,7 +2348,33 @@ def nn_shape_check(model=None, n_samples=64, n_points=400, seed=NN_SEED + 2,
     print("  (band 1 contains LAMBDA_0, so its in-band dynamic range is "
           "intrinsically the smallest)")
 
-    # ---- 2. identifiability (sensitivity singular values) ------------------
+    # ---- 2. per-source vs pooled log-shape spread --------------------------
+    # The per-source column is the quantity the output rescaling targets, and
+    # the one that decides whether a single source's multi-band photometry
+    # carries spectral information.  The blackbody row is the reference the
+    # target constant was hand-picked to resemble, so it can be checked (and
+    # replaced by the measured value) from data rather than by argument.
+    print("\n--- Normalised log-shape spread (per source vs pooled) ---")
+    print("  per-source: std over wavelength of ONE source's log-shape")
+    print("  pooled:     std over (draw, wavelength) = per-source PLUS the "
+          "spread between sources")
+    print("  in-band:    the same per-source std, restricted to one bandpass "
+          "(what sets a band's flux)")
+    print(f"  {'model':<24}{'per-source':>12}{'5-95%':>19}{'pooled':>10}"
+          f"{'in-band':>10}")
+    for name, ref_model in (("active model", model),
+                            ("blackbody (reference)", BlackbodySpectrum())):
+        spread = _log_shape_spread(ref_model, n_samples=n_samples,
+                                  n_points=n_points, seed=seed)
+        print(f"  {name:<24}{spread['per_source_median']:>12.4f}"
+              f"{spread['per_source_lo']:>10.4f} -"
+              f"{spread['per_source_hi']:<8.4f}"
+              f"{spread['pooled']:>10.4f}"
+              f"{spread['in_band_median']:>10.4f}")
+    print(f"  (the output rescaling targets the per-source median: "
+          f"NN_TARGET_LOG_SHAPE_STD = {NN_TARGET_LOG_SHAPE_STD:g})")
+
+    # ---- 3. identifiability (sensitivity singular values) ------------------
     n_params = model.n_params
     if n_params > 0:
         print(f"\n--- Identifiability: singular values of d log shape / d "
@@ -2265,7 +2393,7 @@ def nn_shape_check(model=None, n_samples=64, n_points=400, seed=NN_SEED + 2,
                   "change the spectrum at all, so they cannot be recovered "
                   "from these bands no matter how long the fit runs.")
 
-    # ---- 3. plot + implied counts -----------------------------------------
+    # ---- 4. plot + implied counts -----------------------------------------
     fig, ax = plt.subplots(figsize=(9, 5.5))
     for th, curve in zip(theta, shapes):
         ax.plot(lam_np, curve, color="C0", alpha=0.35, lw=1.0)
@@ -2330,6 +2458,17 @@ if __name__ == "__main__":
                        help="Span of the log-wavelength Fourier embedding, "
                             "i.e. the range of ln(lambda) covered "
                             "(default: %(default)s).")
+    parser.add_argument("--nn-film-layers", type=int,
+                       default=NN_FILM_HIDDEN_LAYERS,
+                       help="Hidden layers inside each FiLM branch (neural "
+                            "network only; 0 = a single linear map; "
+                            "default: %(default)s).")
+    parser.add_argument("--nn-film-size-factor", type=float,
+                       default=NN_FILM_SIZE_FACTOR,
+                       help="Width of each FiLM branch's hidden layers as a "
+                            "multiple of len(theta), so the theta path is "
+                            "never a narrower bottleneck than theta "
+                            "(default: %(default)s).")
     parser.add_argument("--nn-shape-check", action="store_true",
                        help="Print/plot the spectrum-model shape and "
                             "identifiability diagnostic, then exit.")
@@ -2343,6 +2482,8 @@ if __name__ == "__main__":
         seed=args.nn_seed,
         n_embeddings=args.nn_embeddings,
         delta_ln_wavelength=args.nn_delta_ln_wavelength,
+        film_hidden_layers=args.nn_film_layers,
+        film_hidden_size_factor=args.nn_film_size_factor,
     )
     _set_spectrum_model(spectrum_model)
 
