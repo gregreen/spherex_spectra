@@ -873,3 +873,99 @@ class NeuralNetSpectrum(eqx.Module):
         return jax.vmap(self._forward, in_axes=(0, None))(
             features, film_params
         )
+
+
+class BlackbodyPlusNNSpectrum(eqx.Module):
+    """Blackbody continuum modulated by a neural-network template.
+
+    A composite of :class:`BlackbodySpectrum` and :class:`NeuralNetSpectrum`
+    that SPLITS the shape parameters between them: ``theta[0]`` is the
+    blackbody's log-temperature, ``theta[1:]`` are the network's parameters.
+    The two log-flux kernels are added::
+
+        log_kernel(lambda; theta) = BB(lambda; theta[0]) + NN(lambda; theta[1:])
+
+    which in linear terms multiplies the blackbody by the network's
+    dimensionless modulation - the familiar "continuum plus flexible
+    correction" model, in which the network absorbs whatever the blackbody
+    cannot describe.  It needs no new machinery: both parts obey the log-flux
+    contract (see the module docstring), so their sum does too, and the
+    caller's normalisation at :data:`LAMBDA_0` still gives a shape of exactly 1
+    there.
+
+    ``n_params = 1 + neural_net.n_params``.  Note that the blackbody's own tilt
+    is normally the *larger* contribution to the total log-shape (a 3-8 kK
+    blackbody has a per-source log-shape std of ~1.75 over 0.75-5 um, against
+    ~0.5 for the mock's rescaled random network), so the network acts as a
+    modulation *on top of* the continuum rather than as the whole spectrum.
+    The split is positional, so anything that draws, initialises, labels or
+    reports these parameters must treat column 0 as ``log T`` - the mock does
+    (see ``_model_blocks`` / ``_draw_shape_params``).
+
+    Parameters
+    ----------
+    neural_net : NeuralNetSpectrum
+        The network part, already constructed - and, if its output is to be
+        rescaled, already rescaled: such a rescaling modifies the network's own
+        output layer, so it has to happen BEFORE the wrapping.
+    blackbody : BlackbodySpectrum, optional
+        The continuum part; a fresh :class:`BlackbodySpectrum` if omitted.
+
+    Notes
+    -----
+    Batching follows :class:`NeuralNetSpectrum`: ONE source per call, many
+    wavelengths.  To batch over sources, compose a ``vmap`` at the call site::
+
+        jax.vmap(model, in_axes=(None, 0))(wavelengths, shape_params_batch)
+
+    Raises
+    ------
+    ValueError
+        If the network part has no shape parameters of its own: the blackbody
+        consumes ``theta[0]``, so the composite needs at least two in total.
+    """
+
+    blackbody: BlackbodySpectrum
+    neural_net: NeuralNetSpectrum
+    n_params: int
+
+    def __init__(
+        self,
+        neural_net: NeuralNetSpectrum,
+        blackbody: BlackbodySpectrum = None,
+    ):
+        if neural_net.n_params < 1:
+            raise ValueError(
+                "the network part needs at least one shape parameter of its "
+                f"own (got n_params={neural_net.n_params}): the blackbody "
+                "takes theta[0], so the composite needs n_params >= 2"
+            )
+        self.neural_net = neural_net
+        self.blackbody = (
+            BlackbodySpectrum() if blackbody is None else blackbody
+        )
+        self.n_params = 1 + neural_net.n_params
+
+    def __call__(
+        self,
+        wavelength: jnp.ndarray,
+        shape_params: jnp.ndarray,
+    ) -> jnp.ndarray:
+        """Log-flux kernel for ONE source, at many wavelengths.
+
+        Parameters
+        ----------
+        wavelength : jnp.ndarray, shape (N_lambda,)
+            Wavelength(s) in microns.
+        shape_params : jnp.ndarray, shape (n_params,)
+            ``shape_params[0]`` = log(temperature / kK) for the blackbody;
+            ``shape_params[1:]`` go to the network.
+
+        Returns
+        -------
+        jnp.ndarray, shape (N_lambda,)
+            ``log f_lambda`` up to a wavelength-independent constant, i.e. the
+            shared sum of the blackbody and network kernels.
+        """
+        return (self.blackbody(wavelength, shape_params[:1])
+                + self.neural_net(wavelength, shape_params[1:]))

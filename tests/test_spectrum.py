@@ -15,6 +15,7 @@ import pytest
 from spherex.spectrum import (
     BlackbodySpectrum,
     NeuralNetSpectrum,
+    BlackbodyPlusNNSpectrum,
     LAMBDA_0,
     LOG_AMPLITUDE_INDEX,
     split_source_params,
@@ -688,4 +689,93 @@ def test_neural_net_layer_norm_makes_a_random_net_less_flat():
     without, with_ln = median_spread(plain), median_spread(normed)
     assert np.isfinite(without) and np.isfinite(with_ln)
     assert with_ln > 2.0 * without
+
+
+# ---------------------------------------------------------------------------
+# BlackbodyPlusNNSpectrum
+# ---------------------------------------------------------------------------
+#
+# A composite of the two models above: theta[0] goes to the blackbody,
+# theta[1:] to the network, and the log-flux kernels are added (so in linear
+# terms the blackbody is multiplied by the network's dimensionless modulation).
+
+
+@pytest.fixture
+def composite():
+    return BlackbodyPlusNNSpectrum(
+        NeuralNetSpectrum(n_params=2, n_hidden_layers=2, hidden_size=8,
+                          key=jax.random.PRNGKey(0))
+    )
+
+
+def test_blackbody_plus_nn_splits_theta_between_the_parts(composite):
+    """theta[0] -> blackbody, theta[1:] -> network, and the kernels ADD."""
+    assert composite.n_params == 1 + composite.neural_net.n_params
+    assert composite.n_params == 3
+
+    lam = jnp.linspace(0.4, 5.0, 17)
+    theta = jnp.array([0.7, 0.3, -0.4])
+
+    total = np.asarray(normalized_log_shape(composite, lam, theta))
+    parts = (np.asarray(normalized_log_shape(composite.blackbody, lam,
+                                             theta[:1]))
+             + np.asarray(normalized_log_shape(composite.neural_net, lam,
+                                               theta[1:])))
+    # Both sides anchor at LAMBDA_0, so the identity is exact in exact
+    # arithmetic; the tolerance reflects float32 cancellation in
+    # (a + b) - (a0 + b0) versus (a - a0) + (b - b0).
+    np.testing.assert_allclose(total, parts, rtol=1e-5, atol=1e-6)
+
+
+def test_blackbody_plus_nn_keeps_the_log_flux_contract(composite):
+    """Anchoring, positivity, differentiability and the batching convention."""
+    lam = jnp.linspace(0.4, 5.0, 17)
+    theta = jnp.array([0.7, 0.3, -0.4])
+
+    assert composite(lam, theta).shape == (17,)
+    # Exactly 1 at LAMBDA_0 -> the amplitude keeps its meaning.
+    assert float(normalized_log_shape(
+        composite, jnp.array([LAMBDA_0]), theta)[0]) == pytest.approx(
+            0.0, abs=1e-6)
+
+    shape = np.asarray(normalized_shape(composite, lam, theta))
+    assert np.all(np.isfinite(shape))
+    assert np.all(shape > 0.0)
+
+    # Every parameter (the temperature AND the network's) has a gradient.
+    grad = np.asarray(jax.grad(
+        lambda t: jnp.sum(composite(lam, t)))(theta))
+    assert grad.shape == (3,)
+    assert np.all(np.isfinite(grad))
+    assert np.any(np.abs(grad) > 1e-12)
+
+    # One source per call; sources are the caller's vmap.
+    thetas = jnp.stack([theta, theta + 0.5])
+    batched = np.asarray(jax.vmap(composite, in_axes=(None, 0))(lam, thetas))
+    for i in range(thetas.shape[0]):
+        np.testing.assert_allclose(
+            batched[i], np.asarray(composite(lam, thetas[i])), rtol=1e-6)
+
+
+def test_blackbody_plus_nn_uses_the_parts_it_is_given():
+    """An explicit blackbody instance is used; one is built if omitted."""
+    net = NeuralNetSpectrum(n_params=1, n_hidden_layers=1, hidden_size=8,
+                            key=jax.random.PRNGKey(1))
+    model = BlackbodyPlusNNSpectrum(net)
+    assert isinstance(model.blackbody, BlackbodySpectrum)
+    assert model.neural_net is net
+
+    bb = BlackbodySpectrum()
+    explicit = BlackbodyPlusNNSpectrum(net, blackbody=bb)
+    assert explicit.blackbody is bb
+    assert explicit.n_params == model.n_params == 2
+
+
+def test_blackbody_plus_nn_needs_a_network_parameter():
+    """The blackbody consumes theta[0], so the network needs at least one."""
+    net = NeuralNetSpectrum(n_params=0, n_hidden_layers=1, hidden_size=8,
+                            film_hidden_size_factor=1.0,
+                            key=jax.random.PRNGKey(2))
+    with pytest.raises(ValueError):
+        BlackbodyPlusNNSpectrum(net)
 

@@ -24,6 +24,7 @@ sys.path.insert(0, os.path.join(
 from spherex import (  # noqa: E402
     BlackbodySpectrum,
     NeuralNetSpectrum,
+    BlackbodyPlusNNSpectrum,
     SpherexImageGenerator,
     SpherexImageGenerator3,
     LAMBDA_0,
@@ -55,8 +56,9 @@ def test_build_spectrum_model_kinds():
     assert model.n_params == 1
 
     default = mock._build_spectrum_model(verbose=False)
-    expected = (BlackbodySpectrum if mock.SPECTRUM_KIND == "blackbody"
-                else NeuralNetSpectrum)
+    expected = {"blackbody": BlackbodySpectrum,
+                "nn": NeuralNetSpectrum,
+                "blackbody+nn": BlackbodyPlusNNSpectrum}[mock.SPECTRUM_KIND]
     assert isinstance(default, expected)
 
 
@@ -88,10 +90,17 @@ def test_nn_rescale_targets_the_per_source_log_shape_std():
     The measurement uses a DIFFERENT key from the one used for the rescaling,
     so this is a genuine out-of-sample check of the target (a finite-sample std
     over the rescaling draw would be exact but circular).
+
+    Theta is drawn at the width of the model's PRIOR, which is both the
+    ensemble the rescaling is calibrated against and the one the catalog is
+    drawn from (see ``test_rescale_caps_the_spread_tail`` for the ceiling on
+    the tail of that same distribution).
     """
     model = _small_nn(seed=11)
     lambdas = mock._wavelength_grid(256)
-    thetas = jax.random.normal(jax.random.PRNGKey(1234), (256, model.n_params))
+    thetas = mock.NN_PRIOR_STD * jax.random.normal(
+        jax.random.PRNGKey(1234), (256, model.n_params)
+    )
 
     log_shape = jax.vmap(
         lambda th: normalized_log_shape(model, lambdas, th)
@@ -107,6 +116,64 @@ def test_nn_rescale_targets_the_per_source_log_shape_std():
     pooled = float(jnp.std(log_shape))
     assert pooled > 0.0
     assert pooled < 4.0 * mock.NN_TARGET_LOG_SHAPE_STD
+
+
+def test_rescale_caps_the_spread_tail():
+    """The rescaling must bound the TAIL of the per-source spread, not just
+    the median.
+
+    The theta -> shape map is steeply nonlinear, so the spread distribution is
+    heavy-tailed: at a unit-width prior the maximum over a few hundred draws is
+    ~170x the median, and one global factor multiplies that tail too.  A
+    log-shape range of ~80 means 36 decades of flux, where ``exp`` overflows
+    float32 to ``inf`` - and ``inf`` times a zero PSF value or mask element is
+    ``NaN``, which poisons chi^2 for every parameter set that touches that
+    source.  On top of narrowing the prior (``NN_PRIOR_STD``), the factor is
+    capped so that a high quantile of the spread cannot exceed
+    ``NN_MAX_LOG_SHAPE_STD``.
+    """
+    model = mock._build_spectrum_model(kind="nn", n_params=2,
+                                       n_hidden_layers=4, hidden_size=16,
+                                       verbose=False)
+    lambdas = mock._wavelength_grid(256)
+    thetas = mock.NN_PRIOR_STD * jax.random.normal(
+        jax.random.PRNGKey(2024), (1024, model.n_params)
+    )
+    log_shape = np.asarray(jax.vmap(
+        lambda th: normalized_log_shape(model, lambdas, th)
+    )(thetas))
+    per_source = log_shape.std(axis=1)
+
+    # The out-of-sample high quantile stays in the neighbourhood of the cap
+    # (the cap itself is calibrated on its own finite draw, so this is a
+    # sanity bound, not an identity).
+    assert np.percentile(per_source,
+                         100.0 * mock.NN_RESCALE_TAIL_QUANTILE) \
+        < 3.0 * mock.NN_MAX_LOG_SHAPE_STD
+
+    # The point of all of it: no drawn source comes anywhere near the float32
+    # exp() limit (~88.7) at the mock's brightest amplitude.
+    worst_exponent = (np.log(mock.AMPLITUDE_MAX)
+                      + log_shape.max(axis=1)).max()
+    assert worst_exponent < 60.0
+
+
+def test_network_prior_and_init_use_the_configured_width():
+    """Both theta draws use the (narrow) configured width.
+
+    The prior sets the tail of the per-source spread that the catalog is drawn
+    from; the initial guess is evaluated by the forward model before any
+    optimisation, so it must live in the same well-behaved region - an
+    over-wide init is where an overflowing exponent shows up first.
+    """
+    model = _small_nn(n_params=3)
+    rng = np.random.default_rng(0)
+    prior = mock._draw_shape_params(rng, 8192, model)
+    init = mock._draw_init_shape_params(rng, 8192, model)
+
+    assert np.std(prior) == pytest.approx(mock.NN_PRIOR_STD, rel=0.05)
+    assert np.std(init) == pytest.approx(mock.NN_INIT_STD, rel=0.05)
+    assert mock.NN_INIT_STD == mock.NN_PRIOR_STD
 
 
 def test_nn_shape_is_normalised_and_positive():
@@ -400,6 +467,135 @@ def test_model_fingerprint_detects_change():
     )
     assert mock._model_fingerprint(film_nudged) != before
     assert mock._model_fingerprint(model) == before
+
+
+def test_blackbody_plus_nn_bookkeeping_and_factory():
+    """The composite kind builds, and theta is split blackbody-first.
+
+    The factory must use the ``NN_*`` hyperparameters for the network part, and
+    every theta-related helper in the mock must treat column 0 as ``log T``.
+    """
+    model = mock._build_spectrum_model(kind="blackbody+nn", n_params=3,
+                                       verbose=False)
+    assert isinstance(model, BlackbodyPlusNNSpectrum)
+    assert model.n_params == 1 + 3
+
+    # The network part is configured by the NN_* hyperparameters as usual.
+    assert model.neural_net.n_params == 3
+    assert model.neural_net.film_hidden_size == max(
+        round(mock.NN_FILM_SIZE_FACTOR * 3), 1)
+
+    mock._set_spectrum_model(model)
+    rng = np.random.default_rng(0)
+    prior = mock._draw_shape_params(rng, 8, model)
+    init = mock._draw_init_shape_params(rng, 8, model)
+    assert prior.shape == init.shape == (8, 4)
+
+    # Column 0 is log T, drawn from the blackbody's range (3-8 kK), for both
+    # the prior and the initial guess.
+    for block in (prior, init):
+        assert np.all(np.exp(block[:, 0]) >= 3.0)
+        assert np.all(np.exp(block[:, 0]) <= 8.0)
+
+    assert mock._shape_param_labels(model) == [
+        "log(T / kK)", "theta_0", "theta_1", "theta_2"]
+    np.testing.assert_allclose(
+        np.asarray(mock._reference_shape_params(model)),
+        [np.log(mock.REFERENCE_TEMPERATURE_K), 0.0, 0.0, 0.0])
+
+    described = mock._describe_shape_params(prior, model)
+    assert "T range:" in described and "theta range:" in described
+    assert "blackbody + neural net" in mock._spectrum_model_name(model)
+
+    # Usable library model, one source per call.
+    out = model(mock._wavelength_grid(16), jnp.asarray(prior[0]))
+    assert out.shape == (16,)
+    assert np.all(np.isfinite(np.asarray(out)))
+
+
+def test_spectra_preview_draws_eight_same_coloured_shapes(tmp_path, monkeypatch):
+    """The preview is one semilog-y axes with 8 curves in a single colour."""
+    model = mock._build_spectrum_model(kind="blackbody", verbose=False)
+    mock._set_spectrum_model(model)
+
+    # The figure is closed inside the function, so capture it on the way out -
+    # and still close it, so no figure is left open for the next test.
+    real_close = mock.plt.close
+    captured = {}
+
+    def _capture(fig=None):
+        captured["fig"] = fig
+        real_close(fig)
+
+    monkeypatch.setattr(mock.plt, "close", _capture)
+
+    fname = tmp_path / "spectra_preview.svg"
+    mock._plot_spectra_preview(model, fname=str(fname), n_points=64)
+
+    assert fname.exists() and fname.stat().st_size > 0
+    ax = captured["fig"].axes[0]
+    assert ax.get_yscale() == "log"
+
+    # One line per drawn spectrum (the decorations are shorter).
+    curves = [line for line in ax.get_lines()
+              if len(line.get_xdata()) == 64]
+    assert len(curves) == 8
+    # ...all in the SAME colour, which is the point of the figure: it previews
+    # the family of curves, not individual sources.
+    assert len({line.get_color() for line in curves}) == 1
+    # Every shape is normalised to 1 at LAMBDA_0, so they share that point.
+    for line in curves:
+        lam = np.asarray(line.get_xdata())
+        idx = int(np.argmin(np.abs(lam - LAMBDA_0)))
+        assert np.asarray(line.get_ydata())[idx] == pytest.approx(1.0,
+                                                                 rel=0.05)
+
+
+@pytest.mark.parametrize("kind", ["blackbody", "nn", "blackbody+nn"])
+def test_spectra_preview_works_for_every_model_kind(kind, tmp_path):
+    """Any model kind can be previewed, including the composite."""
+    import matplotlib.pyplot as plt      # after the mock set the Agg backend
+
+    model = mock._build_spectrum_model(kind=kind, verbose=False)
+    mock._set_spectrum_model(model)
+
+    written = mock._plot_spectra_preview(
+        model, fname=str(tmp_path / f"preview_{kind}.svg"))
+
+    assert os.path.exists(written) and os.path.getsize(written) > 0
+    assert plt.get_fignums() == []       # nothing left open to display
+
+
+def test_spectra_preview_is_written_before_the_images(monkeypatch, tmp_path):
+    """The preview must be produced BEFORE any image is generated.
+
+    Its whole purpose is to show what the model looks like before committing to
+    the expensive part of the run, so the ordering is part of the contract.
+    """
+    model = mock._build_spectrum_model(kind="blackbody", verbose=False)
+    monkeypatch.setattr(mock, "PLOTS_DIR", str(tmp_path))
+    monkeypatch.setattr(mock, "N_SOURCES", 6)
+    monkeypatch.setattr(mock, "N_EXPOSURES", 2)
+    monkeypatch.setattr(mock, "DETECTOR_PIXELS", 32)
+
+    calls = []
+    monkeypatch.setattr(
+        mock, "_plot_spectra_preview",
+        lambda *args, **kwargs: calls.append("preview"))
+
+    class _Stop(Exception):
+        """Stops the pipeline at Step 5 (several steps of setup later)."""
+
+    def _stop(*_args, **_kwargs):
+        calls.append("images")
+        raise _Stop
+
+    monkeypatch.setattr(mock, "_generate_and_save", _stop)
+
+    with pytest.raises(_Stop):
+        mock.end_to_end_mock(spectrum_model=model)
+
+    assert calls == ["preview", "images"]
 
 
 def test_layer_norm_is_passed_through_and_fingerprinted():

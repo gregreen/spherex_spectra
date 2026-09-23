@@ -13,6 +13,25 @@ from .constants import HC_JAX
 from .spectrum import normalized_source_params, split_source_params
 
 
+# Upper bound on the log-flux the generators will exponentiate.  float32
+# ``exp`` overflows to ``inf`` above ~88.7, and a shape parameter far outside
+# its prior's support (a stray theta during a fit, or an over-wide prior)
+# reaches that.  That is worse than a merely large number: ``inf`` multiplied
+# by an exactly zero PSF value, sub-pixel weight or postage-stamp mask element
+# gives ``NaN``, which then poisons chi^2 for EVERY parameter set that touches
+# that source - an unrecoverable, silent failure.  Observed in the mock as
+# ``chi^2 = nan`` at the initial guess while the true-parameter chi^2 was 1.0.
+#
+# The pixel rate multiplies ``exp(log_flux)`` by
+# ``(lambda / hc) * PSF * integral(T)``, which is at most ~1e19 per unit flux
+# density over the SPHEREx range, so a bound of 40 keeps the integrand below
+# ~1e36 - inside float32 - while never touching a physical source: the mock's
+# brightest amplitude is 5e-11 W m^-2 um^-1 (log-flux ~ -24) and a typical
+# shape contributes O(1).  Only the upper end is clipped; a very negative
+# log-flux simply underflows to zero, which is harmless.
+MAX_LOG_FLUX = 40.0
+
+
 # ---------------------------------------------------------------------------
 # Helper
 # ---------------------------------------------------------------------------
@@ -107,6 +126,11 @@ def _one_subpixel_rate(
     inverse CDF of its normalised profile) and ``total_transmission
     (omega_p)`` (the profile's integral over wavelength) - see
     ``spherex.transmission`` for the interface contract.
+
+    The exponent is bounded above by :data:`MAX_LOG_FLUX`, so a shape parameter
+    outside its prior's support degrades a pixel instead of turning the image
+    into ``inf``/``NaN`` (see that constant's comment for why ``NaN`` - an
+    ``inf`` times a zero PSF or mask value - is the dangerous case).
     """
     # Evenly spaced quantiles in the interior of (0, 1) (midpoint rule),
     # avoiding q=0/1 where the inverse CDF can diverge.
@@ -117,10 +141,11 @@ def _one_subpixel_rate(
     log_amplitude, shape_params = split_source_params(source_params)
     # The model returns an unnormalised log-flux, so the amplitude, the shape
     # and the LAMBDA_0 normalisation (folded into log_amplitude by the caller)
-    # all combine inside a single exp.
-    f_lam = jnp.exp(
-        log_amplitude + spectrum_model(lambdas, shape_params)
-    )                                                          # (N_λ,)
+    # all combine inside a single exp.  The exponent is bounded (see
+    # MAX_LOG_FLUX) so that an out-of-prior theta can only make one pixel
+    # wrong - never turn the whole forward model into inf/NaN.
+    log_flux = log_amplitude + spectrum_model(lambdas, shape_params)
+    f_lam = jnp.exp(jnp.minimum(log_flux, MAX_LOG_FLUX))       # (N_λ,)
 
     psf_val = psf(omega_p, omega_s, lambdas)                  # (N_λ,)
 

@@ -1,8 +1,10 @@
 """Tests for SPHEREx image generation."""
 
 import astropy.units as u
+import equinox as eqx
 import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
 
 from spherex import (
@@ -17,6 +19,8 @@ from spherex import (
 )
 
 from spherex.constants import TEMPERATURE_UNIT
+from spherex.image import MAX_LOG_FLUX
+from spherex.spectrum import normalized_source_params
 
 
 # ---------------------------------------------------------------------------
@@ -129,6 +133,91 @@ def test_photon_rate_scales_with_aperture(psf, transmission, spectrum_model):
     r1 = photon_rate_per_pixel(aperture=1.0, **kwargs)
     r2 = photon_rate_per_pixel(aperture=2.0, **kwargs)
     assert jnp.allclose(r2, 2.0 * r1)
+
+
+# ---------------------------------------------------------------------------
+# Numeric safety of the exponent
+# ---------------------------------------------------------------------------
+
+class _PowerLawSpectrum(eqx.Module):
+    """Toy log-flux model: a power law whose exponent IS the shape parameter.
+
+    The library contract is just ``__call__(wavelength, shape_params)``
+    returning an unnormalised log-flux (plus ``n_params``), so a model whose
+    log-shape range can be dialled at will is the cleanest way to drive the
+    exponent past the float32 limit.
+    """
+    n_params: int = 1
+
+    def __call__(self, wavelength, shape_params):
+        return shape_params[0] * jnp.log(jnp.atleast_1d(wavelength))
+
+
+@pytest.fixture
+def long_wavelength_transmission():
+    """A bandpass far from LAMBDA_0 = 1 um, so a power law has a large shape."""
+    return GaussianFilterTransmission(
+        lambda_intercept=3.0,
+        lambda_slope=0.01,
+        width=0.05,
+    )
+
+
+def test_runaway_theta_cannot_overflow_the_exponent(psf,
+                                                   long_wavelength_transmission):
+    """An out-of-prior theta must degrade a pixel, never produce inf/NaN.
+
+    ``exp(log_flux)`` overflows float32 above ~88.7, and the overflow is worse
+    than a large number: ``inf`` times an exactly zero PSF value, sub-pixel
+    weight or postage-stamp mask element is ``NaN``, which then poisons chi^2
+    for EVERY parameter set that touches that source.  Observed in the mock as
+    a ``nan`` loss at the initial guess while the true-parameter loss was
+    1.0002.  ``MAX_LOG_FLUX`` bounds the exponent, so the rate stays finite.
+    """
+    model = _PowerLawSpectrum()
+    transmission = long_wavelength_transmission
+    omega_p_centers = _subpixel_centers(5, 5, 0.5, 3)
+    omega_s = jnp.array([2.75, 2.75])
+
+    # f_lambda(LAMBDA_0) at the mock's brightest amplitude, with a shape
+    # parameter far outside any sane prior.
+    log_amplitude = float(np.log(5e-11))
+    theta = jnp.array([110.0])
+    source_params = jnp.concatenate([jnp.array([log_amplitude]), theta])
+
+    # The exponent this configuration would evaluate, at the wavelength the
+    # integration actually samples: log_amplitude + log-shape.
+    norm_params = normalized_source_params(model, source_params)
+    lam = transmission.quantile(0.5, omega_p_centers[0])
+    exponent = float(norm_params[0] + model(lam, norm_params[1:])[0])
+    assert exponent > 88.7          # the unguarded exp() would overflow
+    assert exponent > MAX_LOG_FLUX  # ...so the bound is doing the work here
+
+    # Why the bound matters at all: inf is not the end of the story.
+    overflowed = jnp.exp(jnp.float32(exponent))
+    assert not np.isfinite(np.asarray(overflowed))
+    assert np.isnan(np.asarray(overflowed * jnp.float32(0.0)))
+
+    rate = np.asarray(photon_rate_per_pixel(
+        omega_p_centers, omega_s, source_params,
+        model, psf, transmission,
+        aperture=1.0, pixel_scale=0.5,
+        oversampling=3, n_wavelength_samples=5,
+    ))
+    assert np.all(np.isfinite(rate))
+    assert np.all(rate >= 0.0)
+
+    # A sane shape parameter is untouched by the bound: the clipped and
+    # unclipped rates agree, i.e. this is a guard, not a change of model.
+    mild = jnp.concatenate([jnp.array([log_amplitude]), jnp.array([-1.0])])
+    rate_mild = np.asarray(photon_rate_per_pixel(
+        omega_p_centers, omega_s, mild,
+        model, psf, transmission,
+        aperture=1.0, pixel_scale=0.5,
+        oversampling=3, n_wavelength_samples=5,
+    ))
+    assert np.all(np.isfinite(rate_mild))
+    assert np.all(rate_mild > 0.0)
 
 
 # ---------------------------------------------------------------------------

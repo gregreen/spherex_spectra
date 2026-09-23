@@ -25,7 +25,8 @@ from astropy import units as u
 from PIL import Image
 
 from spherex import (SpherexImageGenerator, SpherexImageGenerator3,
-                     BlackbodySpectrum, NeuralNetSpectrum)
+                     BlackbodySpectrum, NeuralNetSpectrum,
+                     BlackbodyPlusNNSpectrum)
 from spherex.config import _BANDS
 from spherex.constants import HC_JAX, TEMPERATURE_UNIT
 from spherex.spectrum import (
@@ -128,12 +129,17 @@ N_LAMBDA = 1
 # "blackbody" : analytic BlackbodySpectrum, 1 shape parameter (log T).
 # "nn"        : NeuralNetSpectrum with FROZEN random weights; the number of
 #               shape parameters (theta) is free.
-SPECTRUM_KIND = "nn"
+# "blackbody+nn" : a BlackbodyPlusNNSpectrum, i.e. a blackbody continuum
+#               modulated by the network.  theta[0] is the blackbody's log T
+#               and theta[1:] are the network's parameters, so the model has
+#               1 + NN_N_PARAMS shape parameters; every NN_* hyperparameter
+#               below configures the network part exactly as for "nn".
+SPECTRUM_KIND = "blackbody+nn"
 
 # Neural-network hyperparameters (only used if SPECTRUM_KIND = "nn")
 NN_N_PARAMS = 2
-NN_N_HIDDEN_LAYERS = 2
-NN_HIDDEN_SIZE = 4
+NN_N_HIDDEN_LAYERS = 4
+NN_HIDDEN_SIZE = 16
 NN_SEED = 314159
 
 # FiLM conditioning: theta does not enter the network as an input feature, it
@@ -145,7 +151,7 @@ NN_SEED = 314159
 # however large P is.  NN_FILM_SIZE_FACTOR = 1.0 therefore means "as wide as
 # theta"; raise it for more capacity.  NN_FILM_HIDDEN_LAYERS = 0 would make
 # each branch a single linear map instead of a small MLP.
-NN_FILM_HIDDEN_LAYERS = 1
+NN_FILM_HIDDEN_LAYERS = 0
 NN_FILM_SIZE_FACTOR = 1.0
 
 # Optional LayerNorm after the activation of every hidden layer (see
@@ -179,14 +185,47 @@ NN_DELTA_LN_WAVELENGTH = np.log(5.0 / 0.75)   # full 0.75 - 5.0 um range
 # Note this is a PER-SOURCE statistic: reaching the same number through the
 # spread BETWEEN sources would leave every individual spectrum nearly flat.
 NN_TARGET_LOG_SHAPE_STD = 0.5
-NN_RESCALE_SAMPLES = 64
+# 256 draws, not 64: the median alone would be fine with fewer, but the tail
+# cap below needs enough samples for a 0.99 quantile to mean anything (with 64
+# draws it is essentially the maximum, which is far too noisy to calibrate
+# against).  The whole calibration costs ~1 s.
+NN_RESCALE_SAMPLES = 256
+
+# The rescaling above pins a TYPICAL source, but the theta -> shape map is
+# steeply nonlinear, so a single global factor multiplies the EXTREMES too:
+# the per-source spread is heavy-tailed (measured at the default 4x16 net: max
+# / median ~ 170 at the unit-width prior below).  The tail is what breaks a
+# run - exp() of a log-shape range of ~80 (36 decades of flux) overflows
+# float32 to inf, and inf times a zero PSF/mask value is NaN, which poisons
+# chi^2 for every parameter set that touches that source.  The factor is
+# therefore also capped so that the NN_RESCALE_TAIL_QUANTILE quantile of the
+# per-source spread never exceeds NN_MAX_LOG_SHAPE_STD; whichever of the two
+# limits is tighter wins (on a well-behaved net the cap does not bind - e.g.
+# the 6x32 net keeps the full 0.5 median here, while the heavy-tailed 4x16 net
+# is capped to a 0.20 median and a ~15 log-shape range at worst).
+NN_RESCALE_TAIL_QUANTILE = 0.99
+NN_MAX_LOG_SHAPE_STD = 4.0
+
+# Width of the network's theta PRIOR, theta ~ N(0, NN_PRIOR_STD^2).  This is
+# what sets the TAIL of the per-source spread, and the tail is what breaks:
+# the spread grows steeply with |theta|, so max/median is ~170 at 1.0 but only
+# ~40 at 0.35 (measured over 2048 draws), and the worst-case exponent at the
+# brightest amplitude falls from 292 to 15 for a 4x16 net (float32 exp overflows
+# at 88.7) - and to -3 once the tail cap above is applied too.
+# The rescaling re-normalises the median either way, so a narrower prior keeps
+# the TYPICAL source's shape (NN_TARGET_LOG_SHAPE_STD) and only removes the
+# absurd spectra.
+NN_PRIOR_STD = 0.35
 
 # Standard deviation of the INITIAL theta guess.  Kept separate from the theta
-# PRIOR (which is N(0, 1)) because the initialisation is deliberately
-# different for each model - as it also is for the blackbody, whose prior
-# (log of a uniform draw) is not the same as its initialisation (uniform in
-# log T).
-NN_INIT_STD = 1.0
+# PRIOR because the initialisation is deliberately different for each model -
+# as it also is for the blackbody, whose prior (log of a uniform draw) is not
+# the same as its initialisation (uniform in log T).  For the network it must
+# stay inside the same well-behaved region as the prior: the initial guess is
+# evaluated by the forward model before any optimisation, so an over-wide init
+# is exactly where an overflowing exponent shows up first (it did: the loss at
+# the initial guess was nan while the true-parameter loss was 1.0002).
+NN_INIT_STD = NN_PRIOR_STD
 
 # Reference shape parameters used by the analytic (blackbody-style)
 # diagnostics: a plain 3000 K blackbody for the blackbody model, and theta = 0
@@ -222,6 +261,27 @@ def _is_blackbody(model):
     return isinstance(model, BlackbodySpectrum)
 
 
+def _is_composite(model):
+    """True if ``model`` is a blackbody + neural-network composite."""
+    return isinstance(model, BlackbodyPlusNNSpectrum)
+
+
+def _model_blocks(model):
+    """``[(kind, n_params), ...]`` describing how theta is split.
+
+    A model may take more than one kind of shape parameter: the composite
+    (:class:`BlackbodyPlusNNSpectrum`) takes the blackbody's ``log T`` first
+    and the network's parameters after it, so anything that draws, initialises,
+    labels or summarises theta has to know about the split.  Block order here
+    IS the column order of ``theta``.
+    """
+    if _is_blackbody(model):
+        return [("blackbody", model.n_params)]
+    if _is_composite(model):
+        return [("blackbody", 1), ("nn", model.neural_net.n_params)]
+    return [("nn", model.n_params)]
+
+
 def _wavelength_grid(n_points=512):
     """Wavelength grid (um) spanning every SPHEREx band, LOG-spaced.
 
@@ -238,7 +298,10 @@ def _wavelength_grid(n_points=512):
 
 
 def _rescale_nn_output(model, key, target_std=NN_TARGET_LOG_SHAPE_STD,
-                       n_samples=NN_RESCALE_SAMPLES):
+                       n_samples=NN_RESCALE_SAMPLES,
+                       max_std=NN_MAX_LOG_SHAPE_STD,
+                       tail_quantile=NN_RESCALE_TAIL_QUANTILE,
+                       prior_std=NN_PRIOR_STD):
     """Rescale a :class:`NeuralNetSpectrum` output layer to an O(1) log-shape.
 
     The dimensionless shape is
@@ -261,6 +324,28 @@ def _rescale_nn_output(model, key, target_std=NN_TARGET_LOG_SHAPE_STD,
     run could hit the pooled target while every individual spectrum stayed
     nearly flat, which is exactly the failure the rescaling exists to prevent.
 
+    Two limits, whichever is tighter
+    --------------------------------
+    The factor is the smaller of
+
+    * ``target_std / median(per_source)`` - the intent: a TYPICAL source gets
+      ``target_std``, and
+    * ``max_std / quantile(per_source, tail_quantile)`` - a ceiling on the
+      TAIL.  The median alone is not sufficient, because the theta -> shape map
+      is steeply nonlinear and the per-source spread is heavy-tailed (measured
+      at the mock's 4x16 net: max/median ~ 170 with the unit-width prior it
+      used to have).  One global factor multiplies that tail too, so a few
+      draws per thousand reached a log-shape range of ~80 - 36 decades of flux
+      - where ``exp`` overflows float32 to ``inf``, and ``inf`` times a zero
+      PSF or mask value is ``NaN``, poisoning chi^2 for every parameter set
+      that touches the source.  The ceiling bounds the tail by construction;
+      it does not bind on a well-behaved net, in which case the result is
+      identical to the median-only rescale.
+
+    theta is drawn at the width of the PRIOR (``prior_std``), which is the
+    distribution the catalog is actually drawn from - the right ensemble to
+    calibrate against, and whose tail is the one that has to stay finite.
+
     This keeps a *randomly initialised* network in the same dynamic range as
     the blackbody it replaces, so the directly-specified amplitude range, the
     background level and the resulting detection S/N all stay meaningful.
@@ -269,10 +354,13 @@ def _rescale_nn_output(model, key, target_std=NN_TARGET_LOG_SHAPE_STD,
 
     Returns
     -------
-    (model, factor) : the rescaled model and the factor applied.
+    (model, factor, info) : the rescaled model, the factor applied, and a dict
+        of the measured statistics (``typical_spread``, ``tail_spread``,
+        ``tail_quantile``, ``max_std``, ``prior_std``, ``n_samples``,
+        ``factor``, ``limited_by``).
     """
     lambdas = _wavelength_grid()
-    thetas = jax.random.normal(key, (n_samples, model.n_params))
+    thetas = prior_std * jax.random.normal(key, (n_samples, model.n_params))
 
     # The normalised log-shape is exactly the log-flux minus its value at
     # LAMBDA_0 - the quantity the generators compute per source.
@@ -280,18 +368,41 @@ def _rescale_nn_output(model, key, target_std=NN_TARGET_LOG_SHAPE_STD,
         lambda theta: normalized_log_shape(model, lambdas, theta)
     )(thetas)                                         # (n_samples, n_lambda)
     per_source = jnp.std(log_shape, axis=1)            # (n_samples,)
-    current = float(jnp.median(per_source))
-    if not np.isfinite(current) or current <= 0.0:
-        return model, 1.0
+    info = {
+        "typical_spread": float(jnp.median(per_source)),
+        "tail_spread": float(jnp.quantile(per_source, tail_quantile)),
+        "tail_quantile": float(tail_quantile),
+        "max_std": float(max_std),
+        "prior_std": float(prior_std),
+        "n_samples": int(n_samples),
+        "factor": 1.0,
+        "limited_by": "neither (degenerate spread, left unscaled)",
+    }
+    typical = info["typical_spread"]
+    if not np.isfinite(typical) or typical <= 0.0:
+        return model, 1.0, info
 
-    factor = float(target_std) / current
+    factor = float(target_std) / typical
+    info["limited_by"] = f"typical source (target {target_std:g})"
+
+    # Ceiling on the tail: a no-op unless the distribution is heavy enough
+    # that the median-only factor would let the worst draws overflow.
+    tail = info["tail_spread"]
+    if np.isfinite(tail) and tail > 0.0:
+        ceiling = float(max_std) / tail
+        if ceiling < factor:
+            factor = ceiling
+            info["limited_by"] = (
+                f"{tail_quantile:g} quantile (cap {max_std:g})")
+    info["factor"] = factor
+
     last = len(model.layers) - 1
     rescaled = eqx.tree_at(
         lambda m: m.layers[last].weight,
         model,
         model.layers[last].weight * factor,
     )
-    return rescaled, factor
+    return rescaled, factor, info
 
 
 def _build_spectrum_model(
@@ -313,9 +424,11 @@ def _build_spectrum_model(
 
     Parameters
     ----------
-    kind : {"blackbody", "nn"}
+    kind : {"blackbody", "nn", "blackbody+nn"}
     n_params : int
-        Number of shape parameters ``theta`` (neural-network model only).
+        Number of shape parameters ``theta`` OF THE NETWORK part
+        (neural-network models only).  For "blackbody+nn" the model's total is
+        ``1 + n_params``, since the blackbody takes ``theta[0]``.
     n_hidden_layers, hidden_size : int
     seed : int
         Seed for the neural network's weight initialisation, and (with a
@@ -350,12 +463,13 @@ def _build_spectrum_model(
                   f"(P = {model.n_params} shape parameter(s))")
         return model
 
-    if kind != "nn":
+    if kind not in ("nn", "blackbody+nn"):
         raise ValueError(
-            f"Unknown spectrum kind {kind!r}; expected 'blackbody' or 'nn'"
+            f"Unknown spectrum kind {kind!r}; expected 'blackbody', 'nn' or "
+            "'blackbody+nn'"
         )
 
-    model = NeuralNetSpectrum(
+    neural_net = NeuralNetSpectrum(
         n_params, n_hidden_layers, hidden_size,
         n_embeddings=n_embeddings, delta_ln_wavelength=delta_ln_wavelength,
         film_hidden_layers=film_hidden_layers,
@@ -363,19 +477,35 @@ def _build_spectrum_model(
         layer_norm=layer_norm,
         key=jax.random.PRNGKey(seed),
     )
-    model, factor = _rescale_nn_output(
-        model, jax.random.PRNGKey(seed + 1), target_log_shape_std
+    # The rescale modifies the network's OWN output layer, so it has to happen
+    # before a composite wraps it.  For "blackbody+nn" it sets the amplitude of
+    # the modulation the network adds on top of the continuum.
+    neural_net, factor, rescale_info = _rescale_nn_output(
+        neural_net, jax.random.PRNGKey(seed + 1), target_log_shape_std
     )
+    model = (neural_net if kind == "nn"
+             else BlackbodyPlusNNSpectrum(neural_net))
     if verbose:
-        print(f"  Spectrum model: NeuralNetSpectrum(P={n_params}, "
+        name = ("NeuralNetSpectrum" if kind == "nn"
+                else "BlackbodyPlusNNSpectrum (P = 1 blackbody + P_nn net)")
+        print(f"  Spectrum model: {name}, total P={model.n_params} "
+              f"(P_nn={n_params}), "
               f"layers={n_hidden_layers}, hidden={hidden_size}, "
-              f"film={film_hidden_layers}x{model.film_hidden_size} "
-              f"(={film_hidden_size_factor:g}*P), "
+              f"film={film_hidden_layers}x{neural_net.film_hidden_size} "
+              f"(={film_hidden_size_factor:g}*P_nn), "
               f"ln={'on' if layer_norm else 'off'}, "
               f"embeddings={n_embeddings}/{delta_ln_wavelength:.3f}ln-lambda, "
               f"seed={seed}), random weights FROZEN")
-        print(f"    output layer rescaled by {factor:.4g} to give a per-source "
-              f"log-shape std of ~{target_log_shape_std:g}")
+        print(f"    network rescaled by {factor:.4g}: median per-source "
+              f"log-shape std "
+              f"{rescale_info['typical_spread'] * factor:.3g} (target "
+              f"{target_log_shape_std:g}), "
+              f"{rescale_info['tail_quantile']:g} quantile "
+              f"{rescale_info['tail_spread'] * factor:.3g} (cap "
+              f"{rescale_info['max_std']:g}) from "
+              f"{rescale_info['n_samples']} draws at "
+              f"theta ~ N(0, {rescale_info['prior_std']:g}^2) "
+              f"-> limited by {rescale_info['limited_by']}")
     return model
 
 
@@ -407,67 +537,100 @@ def _model_fingerprint(model):
     return digest.hexdigest()
 
 
+def _prior_theta_block(rng, n_sources, kind, n_params):
+    """Draw one theta block from its PRIOR: ``(n_sources, n_params)``."""
+    if kind == "blackbody":
+        temperatures = rng.uniform(
+            np.exp(LOG_T_BOUNDS[0]), np.exp(LOG_T_BOUNDS[1]), n_sources
+        )
+        return np.log(temperatures)[:, None]
+    return NN_PRIOR_STD * rng.standard_normal((n_sources, n_params))
+
+
+def _init_theta_block(rng, n_sources, kind, n_params):
+    """Draw one theta block for the INITIAL GUESS (deliberately not the
+    prior - see :func:`_draw_init_shape_params`)."""
+    if kind == "blackbody":
+        return rng.uniform(LOG_T_BOUNDS[0], LOG_T_BOUNDS[1], (n_sources, 1))
+    return NN_INIT_STD * rng.standard_normal((n_sources, n_params))
+
+
 def _reference_shape_params(model=None):
     """Reference shape parameters for the analytic diagnostics.
 
-    A 3000 K blackbody for the blackbody model, ``theta = 0`` for the neural
-    network.  Only the *reported* photon counts and the background level use
-    this, so it does not impose any photon-count target.
+    A 3000 K blackbody for the blackbody part, ``theta = 0`` for the neural
+    network part (in that order for a composite model).  Only the *reported*
+    photon counts and the background level use this, so it does not impose any
+    photon-count target.
     """
     model = SPECTRUM_MODEL if model is None else model
-    if _is_blackbody(model):
-        return jnp.array([np.log(REFERENCE_TEMPERATURE_K)])
-    return jnp.zeros(model.n_params)
+    return jnp.concatenate([
+        (jnp.array([np.log(REFERENCE_TEMPERATURE_K)]) if kind == "blackbody"
+         else jnp.zeros(n_params))
+        for kind, n_params in _model_blocks(model)
+    ])
 
 
 def _draw_shape_params(rng, n_sources, model=None):
     """Draw ``(n_sources, P)`` shape parameters from the model's PRIOR.
 
-    (For the neural network the prior is ``theta ~ N(0, I)`` per column; for
-    the blackbody it is ``log T = log(U(3, 8) kK)``.)
+    Drawn block by block in ``theta`` column order (see
+    :func:`_model_blocks`), so the blackbody part of a composite model gets
+    ``log T = log(U(3, 8) kK)`` while the neural-network part gets
+    ``theta ~ N(0, NN_PRIOR_STD^2)`` (a narrow width is deliberate - see the
+    constant).  For a single-block model this is exactly the draw it has
+    always been, up to that width.
     """
     model = SPECTRUM_MODEL if model is None else model
-    if _is_blackbody(model):
-        temperatures = rng.uniform(
-            np.exp(LOG_T_BOUNDS[0]), np.exp(LOG_T_BOUNDS[1]), n_sources
-        )
-        return np.log(temperatures)[:, None]
-    return rng.standard_normal((n_sources, model.n_params))
+    blocks = [_prior_theta_block(rng, n_sources, kind, n_params)
+              for kind, n_params in _model_blocks(model)]
+    return np.concatenate(blocks, axis=1)
 
 
 def _draw_init_shape_params(rng, n_sources, model=None):
     """Draw ``(n_sources, P)`` INITIAL-GUESS shape parameters.
 
     Deliberately *different* from :func:`_draw_shape_params` (and different
-    between models), so that the inference starts away from the prior's own
-    sampling distribution: the blackbody is initialised uniformly in log T,
-    the neural network from ``N(0, NN_INIT_STD^2)``.
+    between blocks), so that the inference starts away from the prior's own
+    sampling distribution: the blackbody part is initialised uniformly in
+    ``log T``, the neural-network part from ``N(0, NN_INIT_STD^2)`` - which by
+    default equals the prior's width ``NN_PRIOR_STD``, since the forward model
+    is evaluated at the initial guess before any optimisation.
     """
     model = SPECTRUM_MODEL if model is None else model
-    if _is_blackbody(model):
-        return rng.uniform(
-            LOG_T_BOUNDS[0], LOG_T_BOUNDS[1], (n_sources, 1)
-        )
-    return NN_INIT_STD * rng.standard_normal((n_sources, model.n_params))
+    blocks = [_init_theta_block(rng, n_sources, kind, n_params)
+              for kind, n_params in _model_blocks(model)]
+    return np.concatenate(blocks, axis=1)
 
 
 def _shape_param_labels(model=None):
     """Human-readable label per shape parameter (length ``P``)."""
     model = SPECTRUM_MODEL if model is None else model
-    if _is_blackbody(model):
-        return ["log(T / kK)"]
-    return [f"theta_{k}" for k in range(model.n_params)]
+    labels = []
+    for kind, n_params in _model_blocks(model):
+        if kind == "blackbody":
+            labels.append("log(T / kK)")
+        else:
+            labels.extend(f"theta_{k}" for k in range(n_params))
+    return labels
 
 
 def _describe_shape_params(shape_params, model=None):
     """One-line summary of a ``(N, P)`` shape-parameter array."""
     model = SPECTRUM_MODEL if model is None else model
     shape_params = np.asarray(shape_params)
-    if _is_blackbody(model):
-        t = np.exp(shape_params[:, 0])
-        return f"T range: [{t.min():.1f}, {t.max():.1f}] kK"
-    return (f"theta range: [{shape_params.min():+.3f}, "
-            f"{shape_params.max():+.3f}] (P = {shape_params.shape[1]})")
+    parts = []
+    start = 0
+    for kind, n_params in _model_blocks(model):
+        block = shape_params[:, start:start + n_params]
+        start += n_params
+        if kind == "blackbody":
+            t = np.exp(block[:, 0])
+            parts.append(f"T range: [{t.min():.1f}, {t.max():.1f}] kK")
+        else:
+            parts.append(f"theta range: [{block.min():+.3f}, "
+                         f"{block.max():+.3f}] (P = {n_params})")
+    return "; ".join(parts)
 
 
 def _make_params(log_amplitudes, shape_params):
@@ -1173,6 +1336,97 @@ def plot_spectra_comparison(true_params, recovered_params, bright_mask,
 
 
 # ---------------------------------------------------------------------------
+# Spectrum preview (drawn before any image is generated)
+# ---------------------------------------------------------------------------
+
+def _plot_spectra_preview(model=None, n_spectra=8, n_points=400,
+                          seed=NN_SEED + 3, fname=None):
+    """Preview the spectra the active model will generate.
+
+    Overlays ``n_spectra`` dimensionless shapes drawn from the model's PRIOR on
+    one semilog-y axes, all in the SAME colour: the figure is a quick "what
+    does this model look like" check made BEFORE any image is rendered, so an
+    obviously wrong configuration - a network that is too flat or too wiggly, a
+    blackbody prior range that is off, a composite whose modulation is too
+    strong - is visible at a glance.  Telling the curves apart is not the
+    point, hence the single colour.
+
+    The curves are SHAPES, normalised to exactly 1 at :data:`LAMBDA_0`; the
+    physical flux density is that times ``exp(log_amplitude)``.  Amplitudes are
+    drawn separately from a power law spanning ~4 decades, so including them
+    here would swamp the figure without adding any shape information (their
+    range is reported by :func:`_report_photon_counts`).
+
+    Parameters
+    ----------
+    model : equinox.Module, optional
+        Defaults to the module-level :data:`SPECTRUM_MODEL`.
+    n_spectra : int
+        Number of prior draws to overlay.
+    n_points : int
+        Number of wavelengths in the plotted grid.
+    seed : int
+        Seed for the prior draws, so the figure is reproducible run to run.
+    fname : str, optional
+        Output path; defaults to ``<PLOTS_DIR>/spectra_preview.svg`` and is
+        resolved at CALL time (not bound as a default argument), so patching
+        ``PLOTS_DIR`` redirects the output.
+
+    Returns
+    -------
+    str
+        The filename written.
+    """
+    model = SPECTRUM_MODEL if model is None else model
+    fname = (os.path.join(PLOTS_DIR, "spectra_preview.svg")
+             if fname is None else fname)
+
+    lambdas = _wavelength_grid(n_points)
+    lam_np = np.asarray(lambdas)
+    rng = np.random.default_rng(seed)
+    theta = jnp.asarray(
+        _draw_shape_params(rng, n_spectra, model), dtype=jnp.float32
+    )
+    shapes = np.asarray(jax.vmap(
+        lambda th: normalized_shape(model, lambdas, th)
+    )(theta))
+
+    fig, ax = plt.subplots(figsize=(9.0, 5.5))
+    for curve in shapes:
+        ax.semilogy(lam_np, curve, color="C0", alpha=0.8, lw=1.2)
+
+    # Same decoration as the other spectrum diagnostics, so the preview reads
+    # like the rest of them.
+    for band in sorted(_BANDS):
+        lo, hi, _r, _name = _BANDS[band]
+        ax.axvline(lo, color="gray", lw=0.5, alpha=0.4)
+        ax.text(0.5 * (lo + hi), 0.99, f"{band}",
+                transform=ax.get_xaxis_transform(),
+                ha="center", va="top", fontsize=7, color="gray")
+    ax.axvline(_BANDS[max(_BANDS)][1], color="gray", lw=0.5, alpha=0.4)
+    ax.axvline(LAMBDA_0, color="k", lw=0.7, alpha=0.4, ls=":")
+    ax.axhline(1.0, color="k", lw=0.5, ls="--", alpha=0.5)  # every curve crosses here
+
+    ax.set_xlim(lam_np.min(), lam_np.max())
+    ax.set_xlabel("Wavelength [um]")
+    ax.set_ylabel(f"Shape  (f_lambda / f_lambda(LAMBDA_0={LAMBDA_0} um))")
+    ax.plot([], [], color="C0", lw=1.2,
+            label=f"{n_spectra} draws from the model prior")
+    ax.legend(loc="upper right", fontsize=8)
+    ax.set_title(f"Spectra this run will generate "
+                 f"({_spectrum_model_name(model)})")
+    fig.tight_layout()
+    directory = os.path.dirname(fname)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    fig.savefig(fname, dpi=150)
+    plt.close(fig)
+    print(f"Saved {fname}  ({n_spectra} prior draws; shapes normalised to 1 "
+          f"at LAMBDA_0 = {LAMBDA_0} um)")
+    return fname
+
+
+# ---------------------------------------------------------------------------
 # Per-source spectrum figures (one file per source)
 # ---------------------------------------------------------------------------
 
@@ -1573,10 +1827,15 @@ def _spectrum_model_name(model=None):
     model = SPECTRUM_MODEL if model is None else model
     if _is_blackbody(model):
         return "blackbody"
-    return (f"neural net, P={model.n_params}, "
-            f"{model.n_hidden_layers}x{model.hidden_size}, "
-            f"film {model.film_hidden_layers}x{model.film_hidden_size}"
-            + (", +LN" if model.layer_norm else ""))
+    # The network hyperparameters live on the network part of a composite.
+    net_model = model.neural_net if _is_composite(model) else model
+    net = (f"{net_model.n_hidden_layers}x{net_model.hidden_size}, "
+           f"film {net_model.film_hidden_layers}x{net_model.film_hidden_size}"
+           + (", +LN" if net_model.layer_norm else ""))
+    if _is_composite(model):
+        return (f"blackbody + neural net, P=1+{net_model.n_params}, "
+                f"{net}")
+    return f"neural net, P={model.n_params}, {net}"
 
 
 def end_to_end_mock(use_lm=False, spectrum_model=None):
@@ -1603,6 +1862,12 @@ def end_to_end_mock(use_lm=False, spectrum_model=None):
     # ---- Step 1: amplitude range + photon-count diagnostic ----------------
     print("\n--- Step 1: Amplitude range ---")
     _report_photon_counts(spectrum_model)
+
+    # ---- spectrum preview (BEFORE any image is generated) -----------------
+    # A quick look at the shapes this model produces, so a misconfigured model
+    # is obvious before the much more expensive image generation starts.
+    print("\n--- Spectrum preview (before image generation) ---")
+    _plot_spectra_preview(spectrum_model)
 
     # ---- Step 2: catalog --------------------------------------------------
     print("\n--- Step 2: Generating source catalog ---")
@@ -2389,7 +2654,11 @@ def nn_shape_check(model=None, n_samples=64, n_points=400, seed=NN_SEED + 2,
               f"{spread['pooled']:>10.4f}"
               f"{spread['in_band_median']:>10.4f}")
     print(f"  (the output rescaling targets the per-source median: "
-          f"NN_TARGET_LOG_SHAPE_STD = {NN_TARGET_LOG_SHAPE_STD:g})")
+          f"NN_TARGET_LOG_SHAPE_STD = {NN_TARGET_LOG_SHAPE_STD:g} from "
+          f"NN_RESCALE_SAMPLES = {NN_RESCALE_SAMPLES} draws at "
+          f"NN_PRIOR_STD = {NN_PRIOR_STD:g}; its "
+          f"{NN_RESCALE_TAIL_QUANTILE:g} quantile is capped at "
+          f"NN_MAX_LOG_SHAPE_STD = {NN_MAX_LOG_SHAPE_STD:g})")
 
     # ---- 3. identifiability (sensitivity singular values) ------------------
     n_params = model.n_params
@@ -2449,10 +2718,13 @@ if __name__ == "__main__":
     parser.add_argument("--lm", action="store_true",
                        help="Use Levenberg-Marquardt (optimistix) instead "
                             "of SGD for the inference step.")
-    parser.add_argument("--spectrum", choices=("blackbody", "nn"),
+    parser.add_argument("--spectrum",
+                       choices=("blackbody", "nn", "blackbody+nn"),
                        default=SPECTRUM_KIND,
                        help="Spectral shape template to simulate with "
-                            "(default: %(default)s).  The model's weights are "
+                            "(default: %(default)s).  'blackbody+nn' is a "
+                            "blackbody continuum modulated by the network, "
+                            "with theta[0] = log T.  The model's weights are "
                             "frozen; only the source parameters are inferred.")
     parser.add_argument("--nn-seed", type=int, default=NN_SEED,
                        help="Seed for the neural network weights "

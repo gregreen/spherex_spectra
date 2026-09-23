@@ -198,6 +198,21 @@ Three conclusions worth keeping: (i) LayerNorm does **not** remove the need for 
 
 The affine scale and offset are initialised to 1 and 0 (identity), which is what makes the option a pure standardisation at initialisation; they are ordinary parameters, so a caller that trains the model trains them, and the mock's frozen-weights fingerprint covers them.
 
+#### 3.2.3 `BlackbodyPlusNNSpectrum`: continuum plus modulation
+
+A composite of the two models above, obtained by **splitting the shape parameters**: $\theta_0$ is the blackbody's log-temperature, $\theta_{1:}$ go to the network, and the two log-flux kernels are *added*:
+
+$$\texttt{model}(\lambda; \theta) = BB(\lambda; \theta_0) + NN(\lambda; \theta_{1:}), \qquad n_\text{params} = 1 + P_\text{nn}$$
+
+In linear terms the blackbody is multiplied by the network's dimensionless modulation, i.e. the familiar "physical continuum plus flexible correction" model in which the network absorbs whatever the blackbody cannot describe. No new machinery is needed: both parts obey the log-flux contract (§2.1), so their sum does too, and the caller's normalisation at $\lambda_0$ still yields a shape of exactly 1 there. The network's own output rescaling (§6.4) applies to the network part *before* wrapping, and it then sets the amplitude of the modulation on top of the continuum.
+
+Two consequences worth remembering:
+
+- **The continuum dominates the total shape.** A 3–8 kK blackbody has a per-source log-shape std of ~1.75 over 0.75–5 µm against a target of 0.5 for the rescaled random network, so the network is a modulation of relative size $\sim e^{0.5}$ rather than the whole spectrum; the shape check reports the composite against the blackbody reference row accordingly (measured at the mock's defaults with `--spectrum blackbody+nn`: composite 1.70, blackbody 1.75).
+- **The split is positional**, so everything that draws, initialises, labels or summarises $\theta$ must treat column 0 as `log T`. In the mock this is centralised in `_model_blocks`, which returns the `(kind, n_params)` blocks in column order — the blackbody prior (`log T = log U(3,8) kK`), initial guess (uniform in `log T`) and label are then applied to column 0 and the network's (`N(0, NN_PRIOR_STD²)` prior, `N(0, NN_INIT_STD²)` init, `theta_k` labels) to the rest, for any `P` and without touching the single-model code paths.
+
+Identifiability is not a problem: with `P_\text{nn} = 2` the singular values of $\partial\log\text{shape}/\partial\theta$ are `[184.9, 164.6, 23.1]` (rank 3, condition number 8), i.e. the temperature direction and the network directions are all constrained by the band coverage.
+
 ### 3.3 `GaussianPSF` (`spherex/psf.py`)
 
 - **Attributes**: `fwhm_ref` (arcsec), `wavelength_ref` (µm)
@@ -356,7 +371,7 @@ Key globals at the top of the file:
 | `N_LAMBDA` | 1 | Wavelength integration samples (quantile-based) |
 | `HALF_STAMP_FLOOR` | 3 | Minimum postage stamp radius (pixels) |
 | `BACKGROUND_FACTOR` | 2.0 | Background = FACTOR × peak rate of faintest star |
-| `SPECTRUM_KIND` | `"nn"` | Shape template: `"blackbody"` or `"nn"` (§6.4) |
+| `SPECTRUM_KIND` | `"nn"` | Shape template: `"blackbody"`, `"nn"` or `"blackbody+nn"` (§6.4) |
 | `NN_N_PARAMS` | 1 | Number of shape parameters θ of the neural network |
 | `NN_N_HIDDEN_LAYERS` | 1 | Hidden layers of the neural network (each modulated by its own FiLM branch) |
 | `NN_HIDDEN_SIZE` | 32 | Neurons per hidden layer |
@@ -365,10 +380,17 @@ Key globals at the top of the file:
 | `NN_LAYER_NORM` | `False` | Per-wavelength LayerNorm after every hidden activation (§3.2.2) |
 | `NN_SEED` | 314159 | Seed for the (frozen) random weights |
 | `NN_TARGET_LOG_SHAPE_STD` | 0.5 | Target *per-source* (over wavelength) spread of the rescaled log-shape |
+| `NN_RESCALE_SAMPLES` | 256 | Draws used to calibrate the rescaling (a 0.99 quantile needs enough samples to be meaningful) |
+| `NN_RESCALE_TAIL_QUANTILE` | 0.99 | Quantile of the per-source spread that the rescaling caps (§7.19) |
+| `NN_MAX_LOG_SHAPE_STD` | 4.0 | Ceiling for that quantile — bounds the tail so `exp` can never overflow to `inf`/`NaN` |
+| `NN_PRIOR_STD` | 0.35 | Width of the network's θ prior, `θ ~ N(0, σ²)` — sets the *tail* of the per-source spread |
+| `NN_INIT_STD` | `= NN_PRIOR_STD` | Width of the initial-guess θ draw |
 
 ### 6.2 Pipeline steps
 
 1. **Amplitude range** (`_report_photon_counts`): amplitudes are specified *directly* on the physical $f_\lambda(\lambda_0)$ scale via the `AMPLITUDE_MIN`/`AMPLITUDE_MAX` constants — there is no photon-count *targeting*. The implied detected photon counts are only *reported*, by integrating the active model's shape (at its reference shape parameters — 3000 K for the blackbody, θ = 0 for the network) over each band with the Gaussian filter, times `EXPOSURE_TIME`. The same reference shape sets the background level (`_compute_background`), so both diagnostics track the active model automatically.
+
+**Spectrum preview (before any image is generated).** Step 1 is followed by `plots/spectra_preview.svg`: `n_spectra = 8` shapes drawn from the active model's prior overlaid on one semilog-y axes, all in the *same* colour (the point is the family of curves, not telling them apart), with the band boundaries marked so it is obvious which part of each curve the six bands sample. It needs nothing but the model, so it costs milliseconds and runs **before** the expensive image generation — a model that is too flat (little spectral information to recover), too wiggly (poor `n_lambda = 1` quadrature), or whose prior range is mis-set is visible at a glance, and it is the quickest way to see what the `--nn-*` options actually do. The curves are the dimensionless *shapes*, normalised to 1 at `LAMBDA_0`; amplitudes are drawn separately from a ~4-decade power law and would swamp the figure without adding shape information (their range is reported by `_report_photon_counts`).
 
 2. **Generate catalog** (`_generate_catalog`): sources uniformly distributed on the sphere within a spherical cap, with shape parameters drawn from the **active model's prior** (log of U(3000, 8000) K for the blackbody, θ ~ N(0, 1) for the network) and power-law amplitudes P(A) ∝ A^{-1.5}.
 
@@ -404,10 +426,15 @@ The mock can be run with a **frozen random `NeuralNetSpectrum`** instead of the 
 ```bash
 python scripts/mock_spherex_images.py                          # blackbody (default)
 python scripts/mock_spherex_images.py --spectrum nn            # frozen random net
+python scripts/mock_spherex_images.py --spectrum blackbody+nn  # continuum + modulation
 python scripts/mock_spherex_images.py --spectrum nn --nn-shape-check
 python scripts/mock_spherex_images.py --spectrum nn --nn-params 3 --nn-layers 2 \
     --nn-hidden 16 --nn-film-layers 1 --nn-film-size-factor 2.0 --nn-layer-norm
 ```
+
+With `--spectrum blackbody+nn` the model is a `BlackbodyPlusNNSpectrum` (§3.2.3): $\theta_0$ is the blackbody's `log T` and the remaining `NN_N_PARAMS` parameters go to the network part, which every `NN_*` hyperparameter configures exactly as it does for `--spectrum nn`. The mock's prior, initial guess, labels and reference parameters all treat column 0 as `log T` (see `_model_blocks`), and the network's output rescaling is applied to the network part before the composite wraps it.
+
+`plots/spectra_preview.svg` (§6.2) is the quickest way to see what these flags do: it is drawn from the model's prior before any image is generated.
 
 θ reaches the network through **FiLM** modulation (§3.2.1), so the shape hyperparameters include the two FiLM ones: `--nn-film-layers` (hidden layers inside each branch; `0` = a single linear map) and `--nn-film-size-factor` (branch width as a multiple of `len(theta)`, i.e. the knob that decides how much of θ can reach γ and β). `--nn-layer-norm` / `--no-nn-layer-norm` additionally inserts a per-wavelength LayerNorm after every hidden activation (§3.2.2); it makes a random net much less flat — at the defaults the output rescaling needs a factor ~5 instead of ~33 — but does **not** remove the need for that rescaling.
 
@@ -421,6 +448,8 @@ python scripts/mock_spherex_images.py --spectrum nn --nn-params 3 --nn-layers 2 
 **The weights are frozen by construction.** The model is never handed to an optimiser, and the generator is a closed-over constant rather than a JIT argument — that is the *only* way the weights could become traced/differentiated values. `end_to_end_mock` hashes every leaf of the model before and after inference and reports `Spectrum model weights unchanged (frozen)`, and `tests/test_mock_spectrum_model.py` asserts the same thing so a future refactor cannot silently unfreeze it.
 
 **Why the output layer is rescaled.** A randomly initialised MLP produces an arbitrary spectrum: the raw network's λ₀-normalised log-shape spread is ~1/50 of the blackbody's, so left alone the frozen net would give near-featureless spectra and the directly specified `AMPLITUDE_MIN`/`AMPLITUDE_MAX` range, the background level and the resulting detection S/N would no longer correspond to the blackbody run. `_rescale_nn_output` therefore scales the final layer's weight block so a TYPICAL source's log-shape has standard deviation `NN_TARGET_LOG_SHAPE_STD = 0.5`. This is *exact* rather than iterative: the shape is `exp(raw(λ;θ) − raw(λ₀;θ))`, which is linear in the final weight block (the final **bias cancels** in the difference, because it does not depend on λ *or* θ), so scaling that block by `f` scales the log-shape by exactly `f`. In practice the factor is ~30–50 — smaller (~5) with `--nn-layer-norm`, i.e. the LayerNorm of §3.2.2 makes a random net much less flat, but it still leaves the *statistic* to be pinned by this rescale rather than guaranteeing it.
+
+The factor is **capped** as well, so that the `NN_RESCALE_TAIL_QUANTILE` (0.99) quantile of the per-source spread cannot exceed `NN_MAX_LOG_SHAPE_STD = 4.0`, and θ itself is drawn from a narrow prior (`NN_PRIOR_STD = 0.35`). Matching the *median* alone leaves the tail free, and the tail is what breaks a run: see §7.19 and §7.21.
 
 The statistic matched is the **per-source** spread — the std over wavelength for one drawn θ, then the median over draws — and not the spread *pooled* over (θ, λ). The pooled number also contains the spread *between* sources, which is a property of the θ prior; because FiLM modulates hidden activations multiplicatively, that between-source spread can dominate, so a run could hit a pooled target while every individual spectrum stayed nearly flat — precisely the failure the rescaling exists to prevent. `nn_shape_check` reports the per-source statistic for the active model **and** for a reference blackbody, so the target constant can be judged from data: at the mock's defaults the FiLM network lands at 0.51 (target 0.5), while a 3–8 kK blackbody gives 1.75 — it varies 3.4× more across the full 0.75–5 µm range, although its *in-band* spread is smaller (0.27 vs 0.38), which is what the per-band columns of the shape check show.
 
@@ -558,6 +587,13 @@ Cheap guard: fingerprint every leaf of the model before and after the fit and co
 
 A randomly initialised MLP has an arbitrary spectrum. Measured here, the raw 3×32 network's λ₀-normalised log-shape varied ~100× less across 0.75–5 µm than the blackbody's over its temperature prior, so it would have produced a nearly featureless, near power-law spectrum, and the directly specified amplitude range, the background level and the resulting detection S/N would no longer have been comparable to the blackbody run they were chosen for. Fix: rescale the final layer's **weight block** so the in-band log-shape has the intended spread (`NN_TARGET_LOG_SHAPE_STD = 0.5`). This is exact, not iterative, because the shape is `exp(raw(λ,θ) − raw(λ₀,θ))` — linear in that block, with the final **bias cancelling** in the difference — so scaling the block by `f` scales the log-shape by exactly `f`.
 
+**A median is not a bound.** Matching a *typical* source is only half the job, because the θ→shape map is steeply nonlinear: the per-source spread is heavy-tailed, and one global factor multiplies that tail too. Measured on the mock's 4×16 net, the spread's maximum over a few hundred draws was ~170× its median, i.e. a log-shape range of ~80 (36 decades of flux). At that point `exp` overflows float32 (limit ≈ 88.7), `inf` meets a zero PSF or mask value and becomes `NaN`, and every parameter set that touches that source has a `nan` χ² — the whole failure chain is dissected in §7.21. Two measures now bound it:
+
+* the **prior width** is narrow (`NN_PRIOR_STD = 0.35`, and the initial guess uses the same width), because the spread grows steeply with |θ|: max/median falls from ~170 at a unit-width prior to ~40 at 0.35, and the rescaling re-normalises the median either way, so only the absurd spectra are removed; and
+* the factor is **capped** so a high quantile of the spread cannot exceed `NN_MAX_LOG_SHAPE_STD = 4.0` (`NN_RESCALE_TAIL_QUANTILE = 0.99`, calibrated from `NN_RESCALE_SAMPLES = 256` draws — a 0.99 quantile needs enough samples to mean anything).
+
+The median target still sets the factor whenever the ceiling allows it, so a well-behaved net is unchanged (a 6×32 net lands on the full 0.5 median; the heavy-tailed 4×16 one is cap-limited to ≈0.2). Worst-case `log f_λ` at the mock's brightest amplitude (float32 `exp` overflows at 88.7): **292 before, −3 for the 4×16 net and +10 for a 6×32 net** after.
+
 Second, a flexible model can be unfittable regardless of the optimiser: if a direction in θ leaves the in-band shape unchanged, that parameter is unidentifiable *in principle*, and a poor recovery is not evidence of a convergence problem. Check it before fitting by looking at the singular values of $\partial \log \text{shape}/\partial\theta$ over the observed wavelengths (unit-independent, because the log-shape is dimensionless): near-zero singular values are the null directions. Practically, a parameter count approaching the number of distinct bands should be treated as a plumbing test, not a physical model.
 
 Also worth remembering when *interpreting* the fit: with a random network, θ has no physical meaning, so the θ-vs-θ scatter is only a parameter-recovery plot; the scientifically meaningful diagnostic is whether the recovered *spectrum* matches the true one (`plot_spectra_comparison`), and its error should be quoted in dex of log-shape rather than as a parameter offset.
@@ -572,6 +608,26 @@ The spectrum models return an unnormalised log-flux and know nothing about `LAMB
 
 This refines rather than contradicts the frozen note in `image2.py`: that note rules out hoisting over the *whole* stamp (different rows really do have different `λ_c`), whereas the row collapse only shares λ across the column axis. If the remaining cost ever matters, the exact fix is to evaluate the shape once on the union of quantile wavelengths actually used by the stamp and gather into place; the approximate fix is to tabulate the shape per source on a λ grid and interpolate — the shape depends only on λ, so the calibration's x-dependence does not invalidate that route.
 
+### 7.21 An unbounded exponent is a `NaN`, not an `inf` — and `NaN` is contagious
+
+A model that runs away numerically should look like an absurdly large number, not like poison. Here it was poison, and the symptom was actively misleading: the mock printed `Loss (chi^2 / pixel) at TRUE parameters: 1.0002` and then `... at INITIAL GUESS: nan`, which reads like an optimiser or a data problem. It is neither — it is a forward-model failure, and the two evaluations differ only in θ.
+
+The chain, once measured (§7.19 has the numbers):
+
+1. `_rescale_nn_output` set its factor from the **median** per-source log-shape spread, which pins a typical source and leaves the tail free. At the old unit-width θ prior a few draws per thousand reached a log-shape range of ~80.
+2. `f_lam = exp(log_amplitude + log_flux)` in `_one_subpixel_rate` therefore overflowed float32 — `exp` returns `inf` above ≈88.7 — **in the bands whose sampled wavelengths happened to probe the wild part of that draw's shape** (measured: the wildest init rows gave `inf` pixels in bands 3–6 and `NaN` pixels in band 3).
+3. `inf` alone would merely be large (the rate is `inf`, χ² is `inf`) *until* it meets an exactly zero factor: a PSF value, a masked postage-stamp element, or a zero sub-pixel weight. `inf * 0 = NaN` in IEEE arithmetic, so one such pixel makes χ² `NaN` for **every** parameter set containing that source, permanently. `inf` is recoverable; `NaN` is not, and gradient clipping does not help because the gradient is `NaN` too.
+4. Which source hits it depends on the draw, so a run can pass its true-parameter sanity check and fail at the initial guess — the catalog draw was tame, the init draw was not. That is the most confusing possible presentation of a deterministic bug.
+
+The origin is the *scaling* of §7.19: the heavy tail of the θ→shape map, multiplied by a single median-calibrated factor of ~4000. Two layers of defence now exist, and they are deliberately different in kind:
+
+* **Bounds on the distribution** (`NN_PRIOR_STD = 0.35` and the `NN_MAX_LOG_SHAPE_STD = 4.0` ceiling, §7.19) keep the parameters in a region where the exponent never approaches the float32 limit. This is the actual fix: the worst-case `log f_λ` goes from +292 to −3 (4×16 net) or +10 (6×32 net) against a limit of 88.7.
+* **A hard bound on the exponent in the library** — `MAX_LOG_FLUX = 40` in `spherex/image.py::_one_subpixel_rate`, applied as `exp(min(log_flux, MAX_LOG_FLUX))`. 40 comes from the arithmetic of the pixel rate, which multiplies `exp(log_flux)` by `(λ/hc)·PSF·∫T ≲ 1e19`: the integrand then stays below ~1e36, inside float32, while never touching a physical source, since the mock's brightest amplitude is `5e-11 W m⁻² µm⁻¹` (log-flux ≈ −24) and a typical shape contributes O(1). Only the upper end is clipped; a very negative log-flux harmlessly underflows to 0. The guard turns an unrecoverable `NaN` into a bounded, visible error — a seat belt, not the fix.
+
+**What the guard does not do.** It bounds the *exponent*, so it cannot rescue a network that already returns `inf`/`NaN` from its own arithmetic (a θ astronomically far outside the prior can saturate a FiLM scaling inside a hidden layer), and it cannot make χ² finite — an absurd θ still gives a huge or `inf` χ². It is also a *clipping*, so its gradient is exactly zero above the bound: a source pinned there cannot be pulled back by an optimiser. That is why the distribution-level measures, not this constant, are what make the mock safe; the constant only makes any residual failure loud and local instead of silent and global.
+
+**How it would have been caught sooner.** A pre-flight report of the *tail* (not the median) of the per-source spread, together with the implied worst-case exponent at the brightest amplitude, would have flagged the configuration before the first image was generated. Note the two sanity checks that exist did pass: the true-parameter χ² was 1.0002, and `nn_shape_check` reports the *median* per-source spread (0.51 vs a 0.5 target) — a statistic that is blind to the tail by construction.
+
 ---
 
 ## 8. File Map
@@ -579,10 +635,10 @@ This refines rather than contradicts the frozen note in `image2.py`: that note r
 | File | Purpose |
 |---|---|
 | `spherex/constants.py` | Physical constants in codebase-native units (kJ, µm, arcsec) |
-| `spherex/spectrum.py` | `BlackbodySpectrum` (analytic) and `NeuralNetSpectrum` (MLP) — unnormalised log-flux templates — plus the `[log_amplitude, shape…]` layout helpers and the caller-side `LAMBDA_0` anchors (`reference_log_flux`, `normalized_log_shape`, `normalized_shape`, `normalized_source_params`) |
+| `spherex/spectrum.py` | `BlackbodySpectrum` (analytic), `NeuralNetSpectrum` (MLP with FiLM conditioning and an optional LayerNorm) and `BlackbodyPlusNNSpectrum` (continuum + modulation composite) — unnormalised log-flux templates — plus the `[log_amplitude, shape…]` layout helpers and the caller-side `LAMBDA_0` anchors (`reference_log_flux`, `normalized_log_shape`, `normalized_shape`, `normalized_source_params`) |
 | `spherex/psf.py` | `GaussianPSF` — wavelength-dependent Gaussian PSF |
 | `spherex/transmission.py` | `GaussianFilterTransmission` — LVF transmission with quantile interface |
-| `spherex/image.py` | `_one_subpixel_rate` (quantile integration; applies `exp(log_amplitude + log_flux)` for pre-normalised params), `photon_rate_per_pixel` (normalises once per source), `ImageGenerator` (scan-based) |
+| `spherex/image.py` | `_one_subpixel_rate` (quantile integration; applies `exp(log_amplitude + log_flux)` for pre-normalised params, with the exponent bounded by `MAX_LOG_FLUX`, §7.21), `photon_rate_per_pixel` (normalises once per source), `ImageGenerator` (scan-based) |
 | `spherex/image3.py` | `ImageGenerator3` (chunked-batch, uses `_one_subpixel_rate` from `image.py`; folds the `LAMBDA_0` normalisation once per source in `_stamp_batch`), plus `source_stamps` for the amplitude-solve preconditioner |
 | `spherex/config.py` | `SpherexImageGenerator`, `SpherexImageGenerator3` — pre-configured per-band generators, `_build_band(..., spectrum_model=None)` (the spectrum-model injection point), band table |
 | `spherex/__init__.py` | Public API exports |
