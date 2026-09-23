@@ -385,3 +385,262 @@ def test_neural_net_spectrum_is_a_valid_library_model():
     assert model.n_params == 2
     # Shape of a single source: (N_lambda,) - the model must NOT batch itself.
     assert model(mock._wavelength_grid(16), jnp.zeros(2)).shape == (16,)
+
+
+# ---------------------------------------------------------------------------
+# Per-source spectrum diagnostics
+# ---------------------------------------------------------------------------
+
+def _tiny_exposure(n_sources=3, band=3, half_stamp=8, image=32, seed=0,
+                   model=None):
+    """One synthetic exposure in the format the diagnostics expect."""
+    model = mock.SPECTRUM_MODEL if model is None else model
+    gen = SpherexImageGenerator3(
+        band=band, image_width=image, image_height=image, pixel_scale=6.2,
+        spectrum_model=model,
+    )
+
+    rng = np.random.default_rng(seed)
+    positions = jnp.asarray(
+        rng.uniform(8.0, image - 8.0, (n_sources, 2)), dtype=jnp.float32
+    )
+    log_amplitude = np.log(rng.uniform(3e-18, 3e-17, n_sources))
+    if mock._is_blackbody(model):
+        shape = np.log(rng.uniform(3.0, 8.0, (n_sources, 1)))
+    else:
+        shape = rng.normal(0.0, 1.0, (n_sources, model.n_params))
+    params = jnp.asarray(np.column_stack([log_amplitude, shape]),
+                         dtype=jnp.float32)
+
+    rate = gen(positions, params, postage_stamp_half_size=half_stamp,
+               n_wavelength_samples=2, oversampling=2)
+    counts = (np.asarray(rate) + 1e-3) * EXPOSURE_TIME
+    sigma = np.sqrt(np.maximum(counts, 0.0) + 1.0)
+
+    src_idx = np.arange(n_sources, dtype=np.int32)
+    per_exposure_data = [(positions, params, band, None, half_stamp, src_idx)]
+    inf_exposures = [(
+        jnp.asarray(counts, dtype=jnp.float32),
+        jnp.asarray(sigma, dtype=jnp.float32),
+        positions, gen, half_stamp, src_idx,
+    )]
+    return per_exposure_data, inf_exposures
+
+
+def test_shared_snr_reproduces_the_bright_mask():
+    """Sharing the per-exposure S/N sweep must not change the bright mask."""
+    model = mock._build_spectrum_model(kind="blackbody", verbose=False)
+    mock._set_spectrum_model(model)
+    per_exposure_data, inf_exposures = _tiny_exposure(model=model, n_sources=4)
+
+    precomputed = mock._per_exposure_source_snr(per_exposure_data,
+                                                inf_exposures)
+    with_shared = mock._compute_bright_mask(
+        per_exposure_data, inf_exposures, 4, snr_per_exposure=precomputed)
+    without = mock._compute_bright_mask(per_exposure_data, inf_exposures, 4)
+
+    assert with_shared.tolist() == without.tolist()
+    band, src_idx, snr = precomputed[0]
+    assert band == 3
+    np.testing.assert_array_equal(src_idx, np.arange(4))
+    assert np.asarray(snr).shape == (4,)
+
+
+def test_observed_central_wavelengths_follow_the_linear_variable_filter():
+    """lambda_c = intercept + slope * y, in arcsec, and independent of x."""
+    model = mock._build_spectrum_model(kind="blackbody", verbose=False)
+    gen = SpherexImageGenerator3(
+        band=3, image_width=32, image_height=32, pixel_scale=6.2,
+        spectrum_model=model,
+    )
+    positions = np.array([[10.0, 0.0], [10.0, 16.0], [25.0, 16.0]])
+
+    lam_c = mock._observed_central_wavelengths(gen, positions)
+
+    intercept = gen.transmission.lambda_intercept
+    at_y16 = intercept + gen.transmission.lambda_slope * 16.0 * gen.pixel_scale
+    assert lam_c[0] == pytest.approx(intercept)
+    assert lam_c[1] == pytest.approx(at_y16)
+    assert lam_c[2] == pytest.approx(at_y16)
+
+
+def test_select_plot_sources_takes_the_top_and_a_random_sample():
+    """Selection: highest-amplitude bright sources plus random bright ones."""
+    n = 30
+    rng = np.random.default_rng(0)
+    true_params = np.column_stack([
+        np.log(rng.uniform(1e-18, 1e-16, n)), np.zeros(n),
+    ])
+    bright = np.zeros(n, dtype=bool)
+    bright[[1, 4, 5, 9, 11, 12, 17, 20, 23, 28, 29]] = True
+
+    indices, groups = mock._select_plot_sources(
+        true_params, bright, n_top=3, n_random=4, seed=5)
+
+    assert len(indices) == 7
+    assert groups[:3] == ["top"] * 3 and groups[3:] == ["random"] * 4
+    assert len(set(indices.tolist())) == 7          # the two draws are disjoint
+    assert bright[indices].all()                    # every pick is bright
+
+    bright_idx = np.where(bright)[0]
+    by_amplitude = bright_idx[np.argsort(true_params[bright_idx, 0])[::-1]]
+    assert indices[:3].tolist() == by_amplitude[:3].tolist()
+
+    again, _ = mock._select_plot_sources(true_params, bright, n_top=3,
+                                         n_random=4, seed=5)
+    np.testing.assert_array_equal(indices, again)
+
+
+def test_select_plot_sources_handles_degenerate_cases():
+    n = 5
+    true_params = np.column_stack([np.log(np.full(n, 1e-17)), np.zeros(n)])
+
+    # Fewer bright sources than requested: take what exists, no random draw.
+    indices, groups = mock._select_plot_sources(
+        true_params, np.array([True, False, True, False, False]),
+        n_top=8, n_random=8)
+    assert indices.size == 2 and groups == ["top", "top"]
+
+    # No bright sources at all.
+    indices, groups = mock._select_plot_sources(
+        true_params, np.zeros(n, dtype=bool))
+    assert indices.size == 0 and groups == []
+
+
+def test_source_spectrum_fname_pads_the_index():
+    """``{:02d}`` is a minimum width, so 2- and 3-digit indices both work."""
+    assert mock._source_spectrum_fname(7, "d") == os.path.join(
+        "d", "source_spectrum_07.svg")
+    assert mock._source_spectrum_fname(127, "d") == os.path.join(
+        "d", "source_spectrum_127.svg")
+
+
+def test_source_observation_points_scale_the_error_by_one_over_snr():
+    """The bar is the TRUE flux over the matched-filter S/N of the exposure."""
+    model = mock._build_spectrum_model(kind="blackbody", verbose=False)
+    mock._set_spectrum_model(model)
+    per_exposure_data, inf_exposures = _tiny_exposure(model=model, n_sources=2)
+
+    true_params = np.asarray(per_exposure_data[0][1])
+    recovered = true_params.copy()
+    recovered[:, 0] += 0.2
+
+    snr_per_exposure = mock._per_exposure_source_snr(per_exposure_data,
+                                                     inf_exposures)
+    obs = mock._source_observation_points(
+        0, per_exposure_data, inf_exposures, snr_per_exposure,
+        true_params, recovered, model=model)
+
+    assert obs["wavelength"].size == 1
+    assert obs["band"].tolist() == [3]
+    assert obs["snr"][0] > 0
+    np.testing.assert_allclose(obs["f_error"], obs["f_true"] / obs["snr"])
+    assert np.all(obs["f_recovered"] > 0)
+
+    # The point is the model at the RECOVERED parameters, at that wavelength.
+    lam_c = jnp.asarray(obs["wavelength"], dtype=jnp.float32)
+    expected = np.exp(recovered[0, 0]) * np.asarray(normalized_shape(
+        model, lam_c, jnp.asarray(recovered[0, 1:], dtype=jnp.float32)))
+    np.testing.assert_allclose(obs["f_recovered"], expected, rtol=1e-6)
+
+
+def test_plot_one_source_spectrum_truncates_an_unconstraining_bar(tmp_path):
+    """A bar far taller than the axes must be truncated, not drawn in full.
+
+    An observation whose S/N is far below 1 has a bar of ~``f / S/N``, which
+    would otherwise be drawn as a full-height thin line - indistinguishable
+    from a band boundary.
+    """
+    model = mock._build_spectrum_model(kind="blackbody", verbose=False)
+    mock._set_spectrum_model(model)
+    per_exposure_data, _ = _tiny_exposure(model=model, n_sources=1)
+
+    params = np.asarray(per_exposure_data[0][1])
+    f_true = np.exp(params[0, 0]) * np.ones(2)
+    obs = {
+        "wavelength": np.array([1.5, 2.5]),
+        "f_true": f_true,
+        "f_recovered": f_true,
+        "f_error": np.array([0.01 * f_true[0], 1e6 * f_true[1]]),
+        "band": np.array([3, 3]),
+        "snr": np.array([100.0, 1e-6]),
+        "detected": np.array([True, False]),
+        "band_width": np.array([0.1, 0.1]),
+    }
+    fname = tmp_path / "truncated.svg"
+    mock._plot_one_source_spectrum(0, "top", obs, params, params, model=model,
+                                   fname=str(fname))
+
+    assert fname.exists()
+    assert fname.stat().st_size > 0
+    # The function closes its own figure: nothing is left open to display.
+    import matplotlib.pyplot as plt
+    assert plt.get_fignums() == []
+
+
+def test_source_observation_points_skip_off_detector_stamps():
+    """A stamp that falls off the detector is not an observation.
+
+    The catalog keeps sources within ``half_stamp`` of the detector edge, so a
+    source can appear in an exposure while contributing essentially no flux.
+    Its matched-filter S/N is then a numerical zero, and ``f_true / S/N`` would
+    draw a bar ~1e10 times the flux - so the point must be dropped instead.
+    """
+    model = mock._build_spectrum_model(kind="blackbody", verbose=False)
+    mock._set_spectrum_model(model)
+    per_exposure_data, inf_exposures = _tiny_exposure(model=model, n_sources=2)
+
+    positions, params, band, wcs, half_stamp, src_idx = per_exposure_data[0]
+    # Source 1 is moved far outside the image: its postage stamp is empty.
+    # Both lists carry the positions (the diagnostics read them from
+    # ``per_exposure_data``, the S/N from ``inf_exposures``).
+    moved = np.array(np.asarray(positions), dtype=np.float32, copy=True)
+    moved[1] = [-200.0, 16.0]
+    moved = jnp.asarray(moved)
+    per_exposure_data = [(moved, params, band, wcs, half_stamp, src_idx)]
+    noisy, sigma, _pos, gen, half, idx = inf_exposures[0]
+    inf_exposures = [(noisy, sigma, moved, gen, half, idx)]
+
+    true_params = np.asarray(params)
+    snr_per_exposure = mock._per_exposure_source_snr(per_exposure_data,
+                                                     inf_exposures)
+
+    kept = mock._source_observation_points(
+        0, per_exposure_data, inf_exposures, snr_per_exposure,
+        true_params, true_params, model=model)
+    dropped = mock._source_observation_points(
+        1, per_exposure_data, inf_exposures, snr_per_exposure,
+        true_params, true_params, model=model)
+
+    assert kept["wavelength"].size == 1          # source 0 still observed
+    assert dropped["wavelength"].size == 0       # source 1 was never observed
+    assert dropped["f_error"].size == 0
+    assert np.all(np.isfinite(kept["f_error"]))
+
+
+def test_plot_source_spectra_writes_one_file_per_source(tmp_path):
+    """The driver writes exactly one figure per selected source."""
+    model = mock._build_spectrum_model(kind="blackbody", verbose=False)
+    mock._set_spectrum_model(model)
+    per_exposure_data, inf_exposures = _tiny_exposure(model=model, n_sources=3)
+
+    true_params = np.asarray(per_exposure_data[0][1])
+    recovered = true_params + 0.01
+    snr_per_exposure = mock._per_exposure_source_snr(per_exposure_data,
+                                                     inf_exposures)
+    bright = np.array([True, True, False])
+
+    written = mock.plot_source_spectra(
+        true_params, recovered, per_exposure_data, inf_exposures, bright,
+        snr_per_exposure, model=model, n_top=1, n_random=1,
+        out_dir=str(tmp_path),
+    )
+
+    assert len(written) == 2
+    for fname in written:
+        assert fname.endswith(".svg")
+        assert os.path.getsize(fname) > 0
+    assert sorted(os.listdir(tmp_path)) == [
+        "source_spectrum_00.svg", "source_spectrum_01.svg",
+    ]
+

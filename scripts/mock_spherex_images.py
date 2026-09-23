@@ -89,6 +89,17 @@ PNG_PERCENTILE_HI = 99.8
 SNR_THRESHOLD = 5.0
 MIN_BANDS = 3
 
+# Lower bound for an observation to count as an observation at all.  A source
+# may sit in an exposure's source list while its postage stamp falls off the
+# detector (the catalog keeps sources within ``half_stamp`` of the edges), so
+# it contributes no measurable flux and its matched-filter S/N is a numerical
+# zero (~1e-11 .. 1e-6) rather than a small detection.  Such a source was NOT
+# observed in that exposure, so the per-source spectrum figures drop it
+# instead of drawing ``f_true / S/N`` - which would be ~1e10 times the flux.
+# The floor is many decades below the faintest real catalog source (S/N >~ 0.1
+# even for A_min) and well above those numerical zeros.
+SNR_FLOOR = 1.0e-3
+
 # Output directory
 PLOTS_DIR = "plots"
 
@@ -913,9 +924,46 @@ def _source_snr(gen, positions, params, sigma_img, half_stamp,
     return np.sqrt(((counts / sig) ** 2).sum(axis=(1, 2)))
 
 
+def _per_exposure_source_snr(per_exposure_data, inf_exposures,
+                             n_lambda=N_LAMBDA, oversampling=2):
+    """Matched-filter S/N of every source in every exposure.
+
+    This is the expensive half of the brightness diagnostics: one
+    :func:`_source_snr` evaluation per exposure, i.e. essentially one forward
+    model per exposure.  Computing it ONCE here lets both
+    :func:`_compute_bright_mask` and the per-source spectrum figures use the
+    same numbers instead of sweeping the forward model twice.
+
+    Parameters
+    ----------
+    per_exposure_data, inf_exposures : list
+        See ``end_to_end_mock``: the first holds each exposure's TRUE source
+        parameters, the second its image, noise map and generator.
+
+    Returns
+    -------
+    list of (band, src_idx, snr)
+        One entry per exposure, in the same order as ``per_exposure_data``.
+        ``src_idx`` holds GLOBAL catalog indices and ``snr`` is aligned with
+        it (the exposure's local source ordering from :func:`_source_snr`).
+    """
+    per_exposure_snr = []
+    for k, (_, params, band, _, half_stamp, src_idx) in enumerate(
+        per_exposure_data
+    ):
+        _, sigma_img, positions, gen, _, _ = inf_exposures[k]
+        snr = _source_snr(
+            gen, positions, params, np.asarray(sigma_img), half_stamp,
+            n_lambda=n_lambda, oversampling=oversampling,
+        )
+        per_exposure_snr.append((band, np.asarray(src_idx), snr))
+    return per_exposure_snr
+
+
 def _compute_bright_mask(per_exposure_data, inf_exposures, n_sources,
                          snr_threshold=SNR_THRESHOLD, min_bands=MIN_BANDS,
-                         n_lambda=N_LAMBDA, oversampling=2):
+                         n_lambda=N_LAMBDA, oversampling=2,
+                         snr_per_exposure=None):
     """Flag sources detected in enough distinct bands to be well measured.
 
     For every exposure the detection S/N of each source is estimated with
@@ -930,22 +978,30 @@ def _compute_bright_mask(per_exposure_data, inf_exposures, n_sources,
     ``src_idx``), so a source's S/N is never counted in a band it was not
     observed in.
 
+    Parameters
+    ----------
+    per_exposure_data, inf_exposures : list
+    n_sources : int
+        Size of the FULL catalog (the mask is indexed by global source index).
+    snr_per_exposure : list of (band, src_idx, snr), optional
+        Precomputed result of :func:`_per_exposure_source_snr`.  Supplying it
+        avoids re-running the most expensive diagnostic in the pipeline; when
+        omitted it is computed here.
+
     Returns
     -------
     np.ndarray of bool, shape (n_sources,)
         True where the source was detected in >= ``min_bands`` bands.
     """
-    detected = np.zeros((n_sources, len(_BANDS)), dtype=bool)
-
-    for k, (_, params, band, _, half_stamp, src_idx) in enumerate(
-        per_exposure_data
-    ):
-        _, sigma_img, positions, gen, _, _ = inf_exposures[k]
-        sigma_img = np.asarray(sigma_img)
-        snr = _source_snr(
-            gen, positions, params, sigma_img, half_stamp,
+    if snr_per_exposure is None:
+        snr_per_exposure = _per_exposure_source_snr(
+            per_exposure_data, inf_exposures,
             n_lambda=n_lambda, oversampling=oversampling,
         )
+
+    detected = np.zeros((n_sources, len(_BANDS)), dtype=bool)
+
+    for band, src_idx, snr in snr_per_exposure:
         above = snr > snr_threshold
         if np.any(above):
             detected[np.asarray(src_idx)[above], band - 1] = True
@@ -1057,6 +1113,402 @@ def plot_spectra_comparison(true_params, recovered_params, bright_mask,
         print(f"  Median |Delta log shape| over bright sources: "
               f"{np.median(err):.4f} dex "
               f"(90th pct {np.percentile(err, 90):.4f})")
+
+
+# ---------------------------------------------------------------------------
+# Per-source spectrum figures (one file per source)
+# ---------------------------------------------------------------------------
+
+def _observed_central_wavelengths(gen, positions_pix):
+    """Bandpass central wavelength at each source's position.
+
+    The linear-variable filter's central wavelength ramps along the detector's
+    y axis, so one source observed in several exposures is sampled at a
+    different wavelength each time (and usually in a different band) - which is
+    what gives it its multi-band coverage.
+
+    Parameters
+    ----------
+    gen : generator
+        Must expose ``transmission`` (with ``central_wavelength``) and
+        ``pixel_scale``.
+    positions_pix : array_like, shape (S, 2)
+        Source positions in PIXEL coordinates, as stored in
+        ``per_exposure_data``.
+
+    Returns
+    -------
+    np.ndarray, shape (S,)
+        Central wavelength(s) in microns.
+    """
+    omega_s = jnp.asarray(positions_pix, dtype=jnp.float32) * gen.pixel_scale
+    return np.asarray(gen.transmission.central_wavelength(omega_s))
+
+
+def _select_plot_sources(true_params, bright_mask, n_top=8, n_random=8, seed=0):
+    """Choose which sources get a per-source spectrum figure.
+
+    The ``n_top`` highest-amplitude BRIGHT sources - ranked by the TRUE
+    amplitude, so the selection is not circular - followed by ``n_random``
+    drawn without replacement from the remaining bright sources.  The random
+    draw is seeded, so the set of files is reproducible run to run.
+
+    Returns
+    -------
+    indices : np.ndarray of int
+        GLOBAL catalog indices, highest amplitude first.
+    groups : list of str
+        ``"top"`` / ``"random"`` tag matching each entry of ``indices``.
+    """
+    true_params = np.asarray(true_params)
+    bright_idx = np.where(np.asarray(bright_mask))[0]
+    if bright_idx.size == 0:
+        return np.array([], dtype=int), []
+
+    order = bright_idx[np.argsort(true_params[bright_idx, 0])[::-1]]
+    top = order[:n_top]
+    rest = order[n_top:]
+
+    n_draw = int(min(n_random, rest.size))
+    if n_draw > 0:
+        random_pick = np.random.default_rng(seed).choice(
+            rest, size=n_draw, replace=False
+        )
+    else:
+        random_pick = np.array([], dtype=int)
+
+    indices = np.concatenate([top, random_pick]).astype(int)
+    groups = ["top"] * len(top) + ["random"] * len(random_pick)
+    return indices, groups
+
+
+def _source_spectrum_fname(index, out_dir=None):
+    """Filename of one source's spectrum figure.
+
+    ``{:02d}`` is a MINIMUM field width, so index 7 gives
+    ``source_spectrum_07.svg`` while index 127 gives
+    ``source_spectrum_127.svg``.
+
+    ``out_dir`` defaults to the module-level :data:`PLOTS_DIR` and is resolved
+    at CALL time (not bound as a default argument), so patching ``PLOTS_DIR``
+    - as the smoke drivers do - actually redirects the output.
+    """
+    out_dir = PLOTS_DIR if out_dir is None else out_dir
+    return os.path.join(out_dir, f"source_spectrum_{index:02d}.svg")
+
+
+def _source_observation_points(index, per_exposure_data, inf_exposures,
+                              snr_per_exposure, true_params, recovered_params,
+                              model=None):
+    """Every observation of ONE source, as plotting points.
+
+    Each exposure the source appears in contributes one point, placed at that
+    exposure's bandpass central wavelength AT THE SOURCE'S OWN POSITION and
+    carrying the RECOVERED flux there::
+
+        f_recovered = exp(log_amplitude_rec) * normalized_shape(model, ...)
+
+    so any vertical offset between a point and the true curve is a recovery
+    error.  The error bar is the source's TRUE flux at that wavelength divided
+    by the exposure's matched-filter S/N: the fractional flux uncertainty of a
+    matched-filter measurement is 1/S/N, which builds the uncertainty out of
+    exactly what is available - the noise level, the PSF, and the true flux.
+
+    Exposures in which the source's postage stamp falls off the detector are
+    SKIPPED: they carry no flux (S/N below :data:`SNR_FLOOR`), so the source
+    was not really observed in them and ``f_true / S/N`` would be meaningless.
+    Points that are present but below :data:`SNR_THRESHOLD` are kept and
+    flagged ``detected=False``, so they are visible as upper-limit-style
+    markers with a large (and honest) uncertainty.
+
+    Parameters
+    ----------
+    index : int
+        GLOBAL catalog index of the source.
+    per_exposure_data, inf_exposures : list
+    snr_per_exposure : list of (band, src_idx, snr)
+        From :func:`_per_exposure_source_snr`.
+    true_params, recovered_params : np.ndarray, shape (N, 1 + P)
+    model : equinox.Module, optional
+
+    Returns
+    -------
+    dict of np.ndarray
+        ``wavelength``, ``f_true``, ``f_recovered``, ``f_error``, ``band``,
+        ``snr``, ``detected`` (S/N above ``SNR_THRESHOLD``) and ``band_width``
+        (bandpass sigma, for drawing the wavelength window each point averages
+        over).  Empty arrays if the source was never observed.
+    """
+    model = SPECTRUM_MODEL if model is None else model
+    true_params = np.asarray(true_params)
+    recovered_params = np.asarray(recovered_params)
+
+    wavelength, f_true, f_rec, f_err = [], [], [], []
+    bands, snrs, detected, widths = [], [], [], []
+
+    for k, (positions_pix, _params, this_band, _wcs, _half,
+            src_idx) in enumerate(per_exposure_data):
+        local = np.flatnonzero(np.asarray(src_idx) == index)
+        if local.size == 0:
+            continue
+
+        _, _, _sigma_img, gen, _, _ = inf_exposures[k]
+        _, _, snr_all = snr_per_exposure[k]
+        snr = np.asarray(snr_all)[local]
+
+        # Drop stamps that fall off the detector: no flux means the source was
+        # not observed in this exposure at all.
+        usable = snr >= SNR_FLOOR
+        if not np.any(usable):
+            continue
+        snr = snr[usable]
+        this_positions = np.asarray(positions_pix)[local][usable]
+
+        lam_c = _observed_central_wavelengths(gen, this_positions)
+        lam_c_j = jnp.asarray(lam_c, dtype=jnp.float32)
+        true_shape = jnp.asarray(true_params[index, 1:], dtype=jnp.float32)
+        rec_shape = jnp.asarray(recovered_params[index, 1:], dtype=jnp.float32)
+
+        this_true = np.exp(true_params[index, 0]) * np.asarray(
+            normalized_shape(model, lam_c_j, true_shape)
+        )
+        this_rec = np.exp(recovered_params[index, 0]) * np.asarray(
+            normalized_shape(model, lam_c_j, rec_shape)
+        )
+        # Fractional flux uncertainty = 1/S/N.  Everything reaching this point
+        # clears SNR_FLOOR, so the bar is always a finite number; NaN remains
+        # the "draw the point without a bar" signal for the plotting code.
+        this_err = np.where(
+            snr > 0, this_true / np.where(snr > 0, snr, 1.0), np.nan
+        )
+
+        n_here = snr.size
+        wavelength.append(lam_c)
+        f_true.append(this_true)
+        f_rec.append(this_rec)
+        f_err.append(this_err)
+        bands.append(np.full(n_here, this_band))
+        snrs.append(snr)
+        detected.append(snr > SNR_THRESHOLD)
+        widths.append(np.full(n_here, float(gen.transmission.width)))
+
+    keys = ("wavelength", "f_true", "f_recovered", "f_error", "band",
+            "snr", "detected", "band_width")
+    if not wavelength:
+        return {key: np.array([]) for key in keys}
+
+    return {
+        "wavelength": np.concatenate(wavelength),
+        "f_true": np.concatenate(f_true),
+        "f_recovered": np.concatenate(f_rec),
+        "f_error": np.concatenate(f_err),
+        "band": np.concatenate(bands).astype(int),
+        "snr": np.concatenate(snrs),
+        "detected": np.concatenate(detected),
+        "band_width": np.concatenate(widths),
+    }
+
+
+def _plot_one_source_spectrum(index, group, obs, true_params, recovered_params,
+                              model=None, fname=None):
+    """Draw and save ONE source's spectrum figure, then close it.
+
+    Shows the true spectrum, the recovered spectrum, and an errorbar per
+    exposure the source was observed in (see
+    :func:`_source_observation_points`).  The y range is set from the TRUE
+    spectrum and the observations, so the figure stays legible even if the
+    recovered spectrum has diverged - that curve then simply leaves the axes.
+
+    Detected observations are filled markers, undetected ones hollow; a bar
+    taller than the axes is truncated and marked with an arrow head at the
+    truncated end (so an unconstraining observation cannot be mistaken for a
+    band boundary).
+    """
+    model = SPECTRUM_MODEL if model is None else model
+    true_params = np.asarray(true_params)
+    recovered_params = np.asarray(recovered_params)
+    if fname is None:
+        fname = _source_spectrum_fname(index)
+
+    lambdas = _wavelength_grid()
+    lam_np = np.asarray(lambdas)
+    true_shape = jnp.asarray(true_params[index, 1:], dtype=jnp.float32)
+    rec_shape = jnp.asarray(recovered_params[index, 1:], dtype=jnp.float32)
+    true_log_amp = float(true_params[index, 0])
+    rec_log_amp = float(recovered_params[index, 0])
+
+    f_true_curve = np.exp(true_log_amp) * np.asarray(
+        normalized_shape(model, lambdas, true_shape)
+    )
+    f_rec_curve = np.exp(rec_log_amp) * np.asarray(
+        normalized_shape(model, lambdas, rec_shape)
+    )
+
+    fig, ax = plt.subplots(figsize=(8.0, 5.5))
+
+    # Band boundaries (same decoration as the other spectrum diagnostics).
+    for band in sorted(_BANDS):
+        lo, hi, _r, _name = _BANDS[band]
+        ax.axvline(lo, color="gray", lw=0.5, alpha=0.4)
+        ax.text(0.5 * (lo + hi), 0.99, f"{band}",
+                transform=ax.get_xaxis_transform(),
+                ha="center", va="top", fontsize=7, color="gray")
+    ax.axvline(_BANDS[max(_BANDS)][1], color="gray", lw=0.5, alpha=0.4)
+    ax.axvline(LAMBDA_0, color="k", lw=0.7, ls=":", alpha=0.4)
+
+    ax.plot(lam_np, f_true_curve, color="C0", lw=1.5, label="True spectrum")
+    ax.plot(lam_np, f_rec_curve, color="C3", lw=1.5, ls="--",
+            label="Recovered spectrum")
+
+    ax.set_xscale("log")
+    ax.set_yscale("log")
+    ax.set_xlim(lam_np.min(), lam_np.max())
+
+    # The y range comes from the TRUE spectrum and the observations, so the
+    # figure stays legible even if the recovered spectrum has diverged - that
+    # curve then simply leaves the axes.
+    reference = np.concatenate([
+        f_true_curve,
+        obs["f_recovered"] if obs["wavelength"].size else np.array([]),
+    ])
+    reference = reference[np.isfinite(reference) & (reference > 0.0)]
+    if reference.size:
+        ax.set_ylim(reference.min() / 5.0, reference.max() * 5.0)
+
+    # One errorbar per observation, coloured by band.  The horizontal bar is
+    # the bandpass sigma: the point actually constrains an average over that
+    # window, not the flux exactly at its lambda_c.
+    bands_present = (
+        sorted(set(obs["band"].tolist())) if obs["wavelength"].size else []
+    )
+    for band in bands_present:
+        colour = _BAND_COLORS.get(int(band), "k")
+        ax.plot([], [], marker="o", ls="none", ms=5, color=colour,
+                label=f"Band {int(band)}")
+
+        in_band = obs["band"] == band
+        for is_detected in (True, False):
+            sel = in_band & (obs["detected"] == is_detected)
+            if not np.any(sel):
+                continue
+            x, y = obs["wavelength"][sel], obs["f_recovered"][sel]
+            err, width = obs["f_error"][sel], obs["band_width"][sel]
+            kwargs = dict(fmt="o", ms=5, ls="none", color=colour,
+                          ecolor=colour, elinewidth=1.0, capsize=2.0,
+                          alpha=1.0 if is_detected else 0.6)
+            if not is_detected:
+                kwargs["markerfacecolor"] = "none"
+
+            good = np.isfinite(err) & (err > 0)
+            if np.any(good):
+                # The bar is clipped to the visible range: an unconstraining
+                # observation (S/N far below 1) has a bar far taller than the
+                # axes, and drawing it in full would look like a band
+                # boundary.  A truncated end gets an arrow head pointing the
+                # way the bar ran off, so the truncation is never mistaken for
+                # a real end.
+                y_lo, y_hi = ax.get_ylim()
+                low = np.maximum(y[good] - err[good], y_lo)
+                high = np.minimum(y[good] + err[good], y_hi)
+                ax.errorbar(x[good], y[good],
+                            yerr=(y[good] - low, high - y[good]),
+                            xerr=width[good], **kwargs)
+
+                ran_below = (y[good] - err[good]) <= y_lo
+                ran_above = (y[good] + err[good]) >= y_hi
+                if np.any(ran_below):
+                    ax.plot(x[good][ran_below], low[ran_below], marker="v",
+                            ms=5, ls="none", color=colour)
+                if np.any(ran_above):
+                    ax.plot(x[good][ran_above], high[ran_above], marker="^",
+                            ms=5, ls="none", color=colour)
+            if np.any(~good):
+                # No usable S/N for this observation: show the point alone.
+                ax.plot(x[~good], y[~good], marker="o", ls="none", ms=5,
+                        color=colour, alpha=kwargs["alpha"],
+                        markerfacecolor=kwargs.get("markerfacecolor", colour))
+
+    ax.set_xlabel("Wavelength [um]")
+    ax.set_ylabel("f_lambda  [W m$^{-2}$ um$^{-1}$]")
+
+    if obs["wavelength"].size and not np.all(obs["detected"]):
+        ax.plot([], [], marker="o", ms=5, ls="none", color="gray",
+                markerfacecolor="none",
+                label=f"not detected (S/N < {SNR_THRESHOLD:g})")
+
+    params_text = "\n".join(
+        f"{label}: true {t:+.2f} / rec {r:+.2f}"
+        for label, t, r in zip(_shape_param_labels(model),
+                               true_params[index, 1:],
+                               recovered_params[index, 1:])
+    )
+    ax.text(0.02, 0.03, params_text, transform=ax.transAxes, fontsize=7,
+            va="bottom", ha="left", family="monospace",
+            bbox=dict(facecolor="white", alpha=0.75, edgecolor="none"))
+
+    ax.set_title(
+        f"Source {index} ({group}) - logA {true_log_amp:.2f}/{rec_log_amp:.2f}"
+        f" - {len(bands_present)} bands observed, "
+        f"{int(np.unique(obs['band'][obs['detected']]).size)} detected "
+        f"[{_spectrum_model_name(model)}]"
+    )
+    ax.legend(loc="upper right", fontsize=8)
+    fig.tight_layout()
+    directory = os.path.dirname(fname)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+    fig.savefig(fname, dpi=150)
+    plt.close(fig)
+    print(f"  Saved {fname}")
+    return fname
+
+
+def plot_source_spectra(true_params, recovered_params, per_exposure_data,
+                        inf_exposures, bright_mask, snr_per_exposure=None,
+                        model=None, n_top=8, n_random=8, seed=0,
+                        out_dir=None, n_lambda=N_LAMBDA, oversampling=2):
+    """Write one standalone spectrum figure per selected source.
+
+    Files are ``<out_dir>/source_spectrum_{index:02d}.svg`` - one per source,
+    named by GLOBAL catalog index - for the ``n_top`` highest-amplitude bright
+    sources plus ``n_random`` further bright sources drawn at random (seeded,
+    so the file set is reproducible).  Each figure compares the source's true
+    and recovered spectra and overlays every exposure it was observed in, as an
+    errorbar at that exposure's central wavelength.  ``out_dir`` defaults to
+    the module-level :data:`PLOTS_DIR` (resolved at call time).
+
+    Returns
+    -------
+    list of str
+        The filenames written.
+    """
+    if snr_per_exposure is None:
+        snr_per_exposure = _per_exposure_source_snr(
+            per_exposure_data, inf_exposures,
+            n_lambda=n_lambda, oversampling=oversampling,
+        )
+
+    indices, groups = _select_plot_sources(
+        true_params, bright_mask, n_top=n_top, n_random=n_random, seed=seed,
+    )
+    if indices.size == 0:
+        print("  No bright sources: skipping the per-source spectrum figures.")
+        return []
+
+    print(f"  Per-source spectrum figures for {indices.size} bright sources "
+          f"({sum(g == 'top' for g in groups)} highest-amplitude + "
+          f"{sum(g == 'random' for g in groups)} random):")
+    written = []
+    for index, group in zip(indices, groups):
+        obs = _source_observation_points(
+            index, per_exposure_data, inf_exposures, snr_per_exposure,
+            true_params, recovered_params, model=model,
+        )
+        written.append(_plot_one_source_spectrum(
+            index, group, obs, true_params, recovered_params,
+            model=model, fname=_source_spectrum_fname(index, out_dir),
+        ))
+    return written
 
 
 def _spectrum_model_name(model=None):
@@ -1267,8 +1719,8 @@ def end_to_end_mock(use_lm=False, spectrum_model=None):
         rec_log_params, log_backgrounds, losses, lrs = infer_parameters(
             inf_exposures,
             init_log_params,
-            n_steps=1024,
-            learning_rate=1e-2,
+            n_steps=256,
+            learning_rate=1e-3,
             momentum=0.3,
             warmup_steps=16,
             n_lambda=N_LAMBDA,
@@ -1383,9 +1835,18 @@ def end_to_end_mock(use_lm=False, spectrum_model=None):
     # convergence problem being diagnosed).  Counting unique bands rather
     # than exposures avoids promoting a source that was simply observed many
     # times in a single band.  See _source_snr / _compute_bright_mask.
+    #
+    # The per-exposure S/N is computed ONCE here and shared with the per-source
+    # spectrum figures below: each exposure's entry costs a full forward model,
+    # so recomputing it would roughly double the cost of the diagnostics.
+    per_exposure_snr = _per_exposure_source_snr(
+        per_exposure_data, inf_exposures,
+        n_lambda=N_LAMBDA, oversampling=2,
+    )
     bright = _compute_bright_mask(
         per_exposure_data, inf_exposures, true_log_params.shape[0],
         n_lambda=N_LAMBDA, oversampling=2,
+        snr_per_exposure=per_exposure_snr,
     )
     print(f"  {int(bright.sum())} / {bright.size} sources are bright "
           f"(S/N > {SNR_THRESHOLD} in >= {MIN_BANDS} bands)")
@@ -1402,6 +1863,14 @@ def end_to_end_mock(use_lm=False, spectrum_model=None):
     plot_spectra_comparison(true_log_params, np.asarray(rec_log_params), bright,
                             spectrum_model,
                             os.path.join(PLOTS_DIR, "spectra_comparison.svg"))
+
+    # ... and then the detailed view: one figure per source, showing the true
+    # and recovered spectra together with every observation of that source
+    # (placed at the central wavelength of the bandpass at the source's
+    # position, with a 1/S/N error bar) - see _source_observation_points.
+    plot_source_spectra(true_log_params, np.asarray(rec_log_params),
+                        per_exposure_data, inf_exposures, bright,
+                        per_exposure_snr, spectrum_model)
 
     print("\nDone.")
 

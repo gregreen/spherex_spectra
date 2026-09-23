@@ -350,7 +350,7 @@ Key globals at the top of the file:
 
 6. **Inference** (see §5). The initial guess uses a **model-specific draw that deliberately differs from the prior**: amplitudes uniform in `[AMPLITUDE_MIN, AMPLITUDE_MAX]`, blackbody shape parameters uniform in log T, network parameters `N(0, NN_INIT_STD²)`.
 
-7. **Diagnostic plots**: loss history (asinh y-scale), true-vs-recovered scatter, predicted/residual images, and — for a flexible model — a true-vs-recovered *spectrum* overlay (`plots/spectra_comparison.svg`, see §6.4).
+7. **Diagnostic plots**: loss history (asinh y-scale), true-vs-recovered scatter, predicted/residual images, — for a flexible model — a true-vs-recovered *spectrum* overlay (`plots/spectra_comparison.svg`, see §6.4), and **one spectrum figure per selected source** (`plots/source_spectrum_{NN}.svg`, see §6.5).
 
    The true-vs-recovered scatter (`plots/comparison.svg`) has **one panel per parameter** (`1 + P` panels, caller-supplied labels; with the blackbody's `P = 1` this is the familiar log A / log T pair). It highlights "bright" sources, defined as those **detected at S/N > `SNR_THRESHOLD` (5) in at least `MIN_BANDS` (3) distinct SPHEREx bands** — bands, not exposures, so that a source repeatedly observed in one band (which constrains only one point of its spectrum) is not promoted. The per-(source, exposure) S/N is the expected matched-filter significance of the source's own noiseless model counts,
 
@@ -397,6 +397,31 @@ python scripts/mock_spherex_images.py --spectrum nn --nn-shape-check
 * That work is small next to the rest of the per-sub-pixel cost (quantile sampling, PSF evaluation, sub-pixel bookkeeping, scatter-add). Paired end-to-end smoke runs (12 sources, 4 exposures, 48 SGD steps) take 12.0/11.6 s with the blackbody, 13.4/13.5 s with an unembedded 2x16 network, and 14.8/14.8 s with the default 8-embedding network — i.e. roughly +14% for the network and a further +11% for the Fourier embedding.
 
 **Quadrature is the price of a flexible shape.** A bandpass integral taken with `n_lambda = 1` is exact only for a shape that varies slowly across the filter. Fourier features deliberately allow faster variation, so the forward model's fidelity is model-dependent — measured as the relative RMS of a band-3 image between `n_lambda = 1` and `n_lambda = 63`, it is ~1.3e-5 for the blackbody, ~1e-6 at `n_embeddings = 0`, ~1e-5 at 2, ~1e-4 at 4 and ~4e-3 (worst pixels ~10%) at the default 8. This does *not* bias a mock run, because generation and fitting share the same `n_lambda`; it does mean the simulated bands stop being faithful band-integrated fluxes, so `--compare-n-lambda` should be re-checked after any change to `n_embeddings`, and either that or `N_LAMBDA` adjusted (raising `N_LAMBDA` multiplies the MLP cost by the same factor, so lowering `n_embeddings` is usually the cheaper lever).
+
+### 6.5 Per-source spectrum figures (`plots/source_spectrum_{NN}.svg`)
+
+The global diagnostics (§6.2 step 7) answer "did the fit work in aggregate?". These figures answer "what does the fit *do* to one source?" — one standalone figure per source, named by its **global catalog index** (`{:02d}` is a minimum field width, so source 7 gives `source_spectrum_07.svg` and a large catalog gives `source_spectrum_127.svg`).
+
+**Which sources.** The `n_top = 8` highest-amplitude *bright* sources — ranked by the **true** amplitude, so the selection cannot be circular — plus `n_random = 8` further bright sources drawn without replacement from what remains (seeded, so the file set is reproducible). Only sources in the bright subsample (§6.2 step 7) are eligible. Degenerate cases are handled rather than special-cased: a catalog with fewer than 16 bright sources simply yields fewer files, and with no bright sources at all the step is skipped with a message. See `_select_plot_sources`.
+
+**What is in a figure.**
+
+* the **true** spectrum $f_\lambda(\lambda; \theta_\text{true})$ and the **recovered** spectrum $f_\lambda(\lambda; \hat\theta)$ over the full 0.75–5 µm range, on log–log axes;
+* one **observation point per exposure** the source appears in, placed at that exposure's bandpass **central wavelength at the source's own position**, $\lambda_c(y)$ — the linear variable filter ramps along $y$, so a source observed several times is sampled at a different $\lambda_c$ each time, which is exactly what gives it its multi-band coverage. The point's height is the **recovered** model flux $\exp(\widehat{\log A})\, \texttt{normalized\_shape}(\lambda_c; \hat\theta)$, so any vertical offset from the true curve is a recovery error and not a plotting artifact;
+* a **vertical error bar** $\pm f_\text{true}(\lambda_c) / (\text{S/N})$: for a matched-filter measurement the *fractional* flux uncertainty is $1/\text{S/N}$, so this builds the uncertainty out of exactly what is available — the noise level, the PSF, and the true flux — using the same matched-filter S/N defined in §6.2 step 7;
+* a **horizontal bar** of width $\sigma_\lambda$ (the bandpass sigma), because the point constrains an average over that window rather than the flux exactly at $\lambda_c$;
+* band boundaries with band numbers, the $\lambda_0$ anchor, and a text box with the true vs recovered shape parameters.
+
+Points are coloured per band and **filled** when detected (S/N > `SNR_THRESHOLD`) and **hollow** when not, so an unconstraining observation is visible as such instead of being silently dropped.
+
+**Two edge cases, and why they are drawn differently.**
+
+1. *The stamp falls off the detector.* `_filter_sources` deliberately keeps sources within `half_stamp` of the detector edges, so a source can be in an exposure's source list while contributing no measurable flux. Its matched-filter S/N is then a numerical zero (~1e-11 – 1e-6) rather than a small detection, and $f_\text{true}/\text{S/N}$ would be ~$10^{10}$ times the flux. Such an exposure is **not an observation** and is skipped (`SNR_FLOOR = 1e-3`, some six decades below the faintest real catalog source and well above the numerical zeros).
+2. *A partially clipped stamp.* A source just off the edge, or with a narrow PSF, can keep a small but real overlap, giving a legitimate but tiny S/N (e.g. 0.01 for a source that is bright in its other bands). The point is **kept** — it is a real measurement, just an unconstraining one — and its bar, which is far taller than the axes, is **truncated to the axis range** and marked with an **arrow head pointing the way the bar ran off**. Without that marker a full-height thin line is easily mistaken for a band boundary.
+
+**Cost.** The S/N sweep is the expensive half of these diagnostics (one forward model per exposure), so it is computed **once** per run, in `_per_exposure_source_snr`, and shared between `_compute_bright_mask` and `plot_source_spectra` instead of sweeping twice. `plot_source_spectra` accepts the precomputed list as `snr_per_exposure` and only falls back to computing it itself when called standalone.
+
+**Note on `PLOTS_DIR`.** `_source_spectrum_fname` and `plot_source_spectra` take `out_dir=None` and resolve it to the module-level `PLOTS_DIR` *inside the body*. Binding it as a default argument (`out_dir=PLOTS_DIR`) captures the directory at import time, so a driver that patches `mock.PLOTS_DIR` would still write to `plots/` — which is exactly the bug this signature avoids.
 
 The one deliberately unoptimised factor that remains is that the shape is evaluated separately for every pixel *column* of a stamp even though the wavelength samples depend only on the row — see §7.20 for why, and for what it would take to remove it.
 
@@ -519,8 +544,8 @@ This refines rather than contradicts the frozen note in `image2.py`: that note r
 | `spherex/config.py` | `SpherexImageGenerator`, `SpherexImageGenerator3` — pre-configured per-band generators, `_build_band(..., spectrum_model=None)` (the spectrum-model injection point), band table |
 | `spherex/__init__.py` | Public API exports |
 | `scripts/inference.py` | `infer_parameters` (SGD, with amplitude interlace), `infer_parameters_lm` (LM), `solve_log_amplitudes` (direct amplitude least-squares), `compute_loss`, `compute_lm_loss`, `plot_loss_history`, `plot_comparison` (one panel per parameter, `1 + P`), residual functions, custom LM solver |
-| `scripts/mock_spherex_images.py` | End-to-end mock: spectrum-model factory + shape-parameter bookkeeping (Step 0), catalog, exposures, image generation, hybrid SGD+LM inference, diagnostics (`--spectrum {blackbody,nn}`, `--nn-shape-check`), benchmarks |
+| `scripts/mock_spherex_images.py` | End-to-end mock: spectrum-model factory + shape-parameter bookkeeping (Step 0), catalog, exposures, image generation, hybrid SGD+LM inference, diagnostics (`--spectrum {blackbody,nn}`, `--nn-shape-check`), per-source spectrum figures (§6.5: `_per_exposure_source_snr`, `_observed_central_wavelengths`, `_select_plot_sources`, `_source_observation_points`, `_plot_one_source_spectrum`, `plot_source_spectra`), benchmarks |
 | `tests/test_image3.py` | Numerical tests verifying ImageGenerator3 ≡ ImageGenerator |
-| `tests/test_mock_spectrum_model.py` | Model factory (determinism, output rescaling), generic `(N, 1 + P)` bookkeeping, generator injection, and the frozen-weights guarantee |
+| `tests/test_mock_spectrum_model.py` | Model factory (determinism, output rescaling), generic `(N, 1 + P)` bookkeeping, generator injection, the frozen-weights guarantee, and the per-source spectrum diagnostics (source selection, `λ_c` from the LVF, the `f/S/N` bar, off-detector observations, one file per source) |
 | `pyproject.toml` | Dependencies: `jax`, `equinox`, `optimistix`, `lineax`, `numpy` |
 | `/memories/jax_optimization_lessons.md` | Persistent notes on LM trust-region tuning and memory safety |
